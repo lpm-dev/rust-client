@@ -3,7 +3,9 @@ use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use lpm_common::{LpmError, is_symlink_or_junction};
+use lpm_common::LpmError;
+#[cfg(any(not(target_os = "linux"), test))]
+use lpm_common::is_symlink_or_junction;
 use lpm_extractor::ExtractedFileDigest;
 use sha2::{Digest, Sha256};
 
@@ -238,7 +240,7 @@ impl TreeMetadataBuilder {
         self.refresh(index, path, payload)
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     pub(crate) fn record_with_metadata(
         &mut self,
         root: &Path,
@@ -422,18 +424,496 @@ fn hash_object_tree_dir(
     } else {
         Vec::new()
     };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let root_fd = has_persistent_root_fd_headroom()
+        .then(|| open_root_dir_fd(root).ok())
+        .flatten();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let root_identity =
+        dir_identity_before_walk(root, root_fd.as_ref().map(std::os::fd::AsFd::as_fd));
     hash_object_tree_dir_inner(
         root,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        root_fd.as_ref().map(std::os::fd::AsFd::as_fd),
         dir,
         &mut relative,
         content_hasher,
         metadata_hasher,
         stats,
         &mut bulk_buffer,
+    )?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    verify_root_identity_after_walk(root, root_identity)?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn has_persistent_root_fd_headroom() -> bool {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `limit` is valid writable storage for `getrlimit`.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: `getrlimit` succeeded and initialized `limit`.
+    unsafe { limit.assume_init() }.rlim_cur >= 256
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn dir_identity_before_walk(
+    root: &Path,
+    root_fd: Option<std::os::fd::BorrowedFd<'_>>,
+) -> Option<(u64, u64)> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    if let Some(fd) = root_fd {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fd` is a valid open directory descriptor and `st` is writable.
+        if unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) } == 0 {
+            // SAFETY: `fstat` succeeded and initialized `st`.
+            let st = unsafe { st.assume_init() };
+            let dev = u64::try_from(i128::from(st.st_dev)).ok()?;
+            let ino = u64::try_from(i128::from(st.st_ino)).ok()?;
+            return Some((dev, ino));
+        }
+    }
+    let meta = std::fs::symlink_metadata(root).ok()?;
+    meta.file_type().is_dir().then(|| (meta.dev(), meta.ino()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_root_identity_after_walk(
+    root: &Path,
+    expected: Option<(u64, u64)>,
+) -> Result<(), LpmError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let meta = std::fs::symlink_metadata(root).map_err(|error| {
+        LpmError::Store(format!(
+            "virtual-store object tree root disappeared during walk at {}: {error}",
+            root.display()
+        ))
+    })?;
+    if !meta.file_type().is_dir() || (meta.dev(), meta.ino()) != expected {
+        return Err(LpmError::Store(format!(
+            "virtual-store object tree root changed during walk at {}",
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_root_dir_fd(root: &Path) -> Result<std::os::fd::OwnedFd, LpmError> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let open_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let c_root = CString::new(root.as_os_str().as_bytes()).map_err(|_| {
+        LpmError::Store(format!(
+            "failed to read virtual-store object tree at {}: path contains NUL",
+            root.display()
+        ))
+    })?;
+    // SAFETY: `c_root` is NUL-terminated.
+    let fd = unsafe { libc::open(c_root.as_ptr(), open_flags) };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(LpmError::Store(format!(
+            "failed to read virtual-store object tree at {}: {error}",
+            root.display()
+        )));
+    }
+    // SAFETY: `fd` is a valid newly opened file descriptor owned exclusively here.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LinuxOpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn try_openat2_confined_dir(
+    base_fd: std::os::fd::RawFd,
+    rel: &Path,
+) -> Option<Result<std::os::fd::OwnedFd, std::io::Error>> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const RESOLVE_BENEATH: u64 = 0x08;
+    static OPENAT2_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+    if OPENAT2_UNAVAILABLE.load(Ordering::Relaxed) {
+        return None;
+    }
+    let Ok(c_rel) = CString::new(rel.as_os_str().as_bytes()) else {
+        return Some(Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains NUL",
+        )));
+    };
+    let how = LinuxOpenHow {
+        flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+    };
+    // SAFETY: `base_fd` is an open directory descriptor, `c_rel` is NUL-terminated,
+    // and `how` matches the Linux UAPI `struct open_how` layout.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            base_fd,
+            c_rel.as_ptr(),
+            &raw const how,
+            std::mem::size_of::<LinuxOpenHow>(),
+        )
+    };
+    if fd >= 0 {
+        // SAFETY: `openat2` returned a valid newly opened file descriptor.
+        return Some(Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) }));
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS | libc::EPERM | libc::EINVAL | libc::EOPNOTSUPP)
+    ) {
+        OPENAT2_UNAVAILABLE.store(true, Ordering::Relaxed);
+        return None;
+    }
+    Some(Err(error))
+}
+
+#[cfg(target_os = "macos")]
+fn try_macos_openat_nofollow_any(
+    base_fd: libc::c_int,
+    rel: &Path,
+) -> Option<std::io::Result<std::os::fd::OwnedFd>> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static NOFOLLOW_ANY_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+    if NOFOLLOW_ANY_UNAVAILABLE.load(Ordering::Relaxed) {
+        return None;
+    }
+    for component in rel.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Some(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid relative path component",
+            )));
+        }
+    }
+    let Ok(c_rel) = CString::new(rel.as_os_str().as_bytes()) else {
+        return Some(Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains NUL",
+        )));
+    };
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW_ANY;
+    // SAFETY: `base_fd` is an open directory fd and `c_rel` is NUL-terminated.
+    let fd = unsafe { libc::openat(base_fd, c_rel.as_ptr(), flags) };
+    if fd >= 0 {
+        // SAFETY: `openat` returned a valid newly opened file descriptor.
+        return Some(Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EINVAL) {
+        NOFOLLOW_ANY_UNAVAILABLE.store(true, Ordering::Relaxed);
+        return None;
+    }
+    Some(Err(error))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_dir_confined_fd(
+    root: &Path,
+    root_fd: Option<std::os::fd::BorrowedFd<'_>>,
+    dir: &Path,
+) -> Result<std::os::fd::OwnedFd, LpmError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let open_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    if let Ok(rel) = dir.strip_prefix(root) {
+        if rel.as_os_str().is_empty() {
+            if let Some(base) = root_fd {
+                // SAFETY: `base` is an open directory fd and "." is NUL-terminated.
+                let fd = unsafe { libc::openat(base.as_raw_fd(), c".".as_ptr(), open_flags) };
+                if fd < 0 {
+                    let error = std::io::Error::last_os_error();
+                    return Err(LpmError::Store(format!(
+                        "failed to read virtual-store object tree at {}: {error}",
+                        dir.display()
+                    )));
+                }
+                // SAFETY: `fd` is a valid newly opened file descriptor.
+                return Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+            }
+            return open_root_dir_fd(root);
+        }
+
+        let owned_root = if root_fd.is_none() {
+            Some(open_root_dir_fd(root)?)
+        } else {
+            None
+        };
+        let base_fd = root_fd.map_or_else(
+            || owned_root.as_ref().expect("opened root fd").as_raw_fd(),
+            |fd| fd.as_raw_fd(),
+        );
+
+        #[cfg(target_os = "linux")]
+        if let Some(result) = try_openat2_confined_dir(base_fd, rel) {
+            return result.map_err(|error| {
+                LpmError::Store(format!(
+                    "failed to read virtual-store object tree at {}: {error}",
+                    dir.display()
+                ))
+            });
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(result) = try_macos_openat_nofollow_any(base_fd, rel) {
+            return result.map_err(|error| {
+                LpmError::Store(format!(
+                    "failed to read virtual-store object tree at {}: {error}",
+                    dir.display()
+                ))
+            });
+        }
+
+        let mut cur_owned: Option<std::os::fd::OwnedFd> = owned_root;
+        let mut use_borrowed_base = cur_owned.is_none();
+        for component in rel.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(LpmError::Store(format!(
+                    "failed to read virtual-store object tree at {}: invalid relative path component",
+                    dir.display()
+                )));
+            };
+            let c_name = CString::new(name.as_bytes()).map_err(|_| {
+                LpmError::Store(format!(
+                    "failed to read virtual-store object tree at {}: path contains NUL",
+                    dir.display()
+                ))
+            })?;
+            let parent_fd = if use_borrowed_base {
+                base_fd
+            } else {
+                cur_owned.as_ref().expect("current dir fd").as_raw_fd()
+            };
+            // SAFETY: `parent_fd` is an open directory fd and `c_name` is NUL-terminated.
+            let next_fd = unsafe { libc::openat(parent_fd, c_name.as_ptr(), open_flags) };
+            if next_fd < 0 {
+                let error = std::io::Error::last_os_error();
+                return Err(LpmError::Store(format!(
+                    "failed to read virtual-store object tree at {}: {error}",
+                    dir.display()
+                )));
+            }
+            // SAFETY: `next_fd` is a valid newly opened file descriptor.
+            cur_owned = Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(next_fd) });
+            use_borrowed_base = false;
+        }
+        return cur_owned.ok_or_else(|| {
+            LpmError::Store(format!(
+                "failed to read virtual-store object tree at {}: empty relative path",
+                dir.display()
+            ))
+        });
+    }
+
+    open_root_dir_fd(dir)
+}
+
+#[cfg(all(test, unix))]
+fn read_object_tree_entries(root: &Path, dir: &Path) -> Result<Vec<ObjectTreeEntry>, LpmError> {
+    read_object_tree_entries_with_root(
+        root,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        None,
+        dir,
     )
 }
 
-fn read_object_tree_entries(root: &Path, dir: &Path) -> Result<Vec<ObjectTreeEntry>, LpmError> {
+fn read_object_tree_entries_with_root(
+    root: &Path,
+    #[cfg(any(target_os = "linux", target_os = "macos"))] root_fd: Option<
+        std::os::fd::BorrowedFd<'_>,
+    >,
+    dir: &Path,
+) -> Result<Vec<ObjectTreeEntry>, LpmError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        read_object_tree_entries_fstatat_with_root(root, root_fd, dir)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        read_object_tree_entries_portable(root, dir)
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn read_object_tree_entries_fstatat(
+    root: &Path,
+    dir: &Path,
+) -> Result<Vec<ObjectTreeEntry>, LpmError> {
+    read_object_tree_entries_fstatat_with_root(root, None, dir)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_object_tree_entries_fstatat_with_root(
+    root: &Path,
+    root_fd: Option<std::os::fd::BorrowedFd<'_>>,
+    dir: &Path,
+) -> Result<Vec<ObjectTreeEntry>, LpmError> {
+    use std::ffi::CStr;
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    struct DirGuard(*mut libc::DIR);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was returned by `fdopendir` and is closed once on drop.
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+    }
+
+    let fd = open_dir_confined_fd(root, root_fd, dir)?.into_raw_fd();
+    // SAFETY: `fd` is an owned open directory descriptor; `fdopendir` takes ownership on success.
+    let dir_ptr = unsafe { libc::fdopendir(fd) };
+    if dir_ptr.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so we still own `fd`.
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(LpmError::Store(format!(
+            "failed to read virtual-store object tree at {}: {error}",
+            dir.display()
+        )));
+    }
+    let _guard = DirGuard(dir_ptr);
+    // SAFETY: `dir_ptr` is live while `_guard` is in scope.
+    let dir_fd = unsafe { libc::dirfd(dir_ptr) };
+
+    let mut entries = Vec::new();
+    loop {
+        clear_unix_errno();
+        // SAFETY: `dir_ptr` is a live DIR* exclusively accessed on this thread.
+        let entry = unsafe { libc::readdir(dir_ptr) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error().unwrap_or(0) != 0 {
+                return Err(LpmError::Store(format!(
+                    "failed to enumerate virtual-store object tree entry: {error}"
+                )));
+            }
+            break;
+        }
+        // SAFETY: `entry` is non-null and `d_name` is NUL-terminated per POSIX.
+        let c_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let name_bytes = c_name.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        let name_os = OsStr::from_bytes(name_bytes);
+        if is_object_metadata_sidecar_name(root, dir, name_os) {
+            continue;
+        }
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `dir_fd` is live, `c_name` is NUL-terminated, and `st` is writable.
+        if unsafe {
+            libc::fstatat(
+                dir_fd,
+                c_name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            return Err(LpmError::Store(format!(
+                "failed to stat virtual-store object tree entry {}: {error}",
+                dir.join(name_os).display()
+            )));
+        }
+        // SAFETY: `fstatat` succeeded and initialized `st`.
+        let st = unsafe { st.assume_init() };
+        #[cfg_attr(
+            target_os = "linux",
+            expect(
+                clippy::unnecessary_cast,
+                reason = "libc::mode_t is u32 on Linux and u16 on macOS"
+            )
+        )]
+        let (mode_bits, kind) = {
+            let mode_bits = st.st_mode as u32;
+            let file_type = mode_bits & (libc::S_IFMT as u32);
+            let kind = if file_type == (libc::S_IFLNK as u32) {
+                ObjectTreeEntryKind::Symlink
+            } else if file_type == (libc::S_IFDIR as u32) {
+                ObjectTreeEntryKind::Directory
+            } else if file_type == (libc::S_IFREG as u32) {
+                ObjectTreeEntryKind::File
+            } else {
+                ObjectTreeEntryKind::Unsupported
+            };
+            (mode_bits, kind)
+        };
+        entries.push(ObjectTreeEntry {
+            name: OsString::from_vec(name_bytes.to_vec()),
+            kind,
+            mode: mode_bits & 0o7777,
+            len: u64::try_from(st.st_size).unwrap_or(0),
+            modified_time_nanos: i128::from(st.st_mtime) * 1_000_000_000
+                + i128::from(st.st_mtime_nsec),
+            change_time_nanos: i128::from(st.st_ctime) * 1_000_000_000
+                + i128::from(st.st_ctime_nsec),
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
+}
+
+#[cfg(target_os = "linux")]
+fn clear_unix_errno() {
+    // SAFETY: `__errno_location` returns this thread's valid errno pointer.
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clear_unix_errno() {
+    // SAFETY: `__error` returns this thread's valid errno pointer.
+    unsafe {
+        *libc::__error() = 0;
+    }
+}
+
+#[cfg(any(not(any(target_os = "linux", target_os = "macos")), test))]
+fn read_object_tree_entries_portable(
+    root: &Path,
+    dir: &Path,
+) -> Result<Vec<ObjectTreeEntry>, LpmError> {
     let mut entries = Vec::new();
     // Unix DirEntry values keep the directory handle alive; store owned names
     // before recursing so deep warm-cache validation stays below RLIMIT_NOFILE.
@@ -472,12 +952,15 @@ thread_local! {
 
 fn read_object_tree_entries_for_walk(
     root: &Path,
+    #[cfg(any(target_os = "linux", target_os = "macos"))] root_fd: Option<
+        std::os::fd::BorrowedFd<'_>,
+    >,
     dir: &Path,
     bulk_buffer: &mut Vec<u8>,
 ) -> Result<Vec<ObjectTreeEntry>, LpmError> {
     #[cfg(target_os = "macos")]
     if !bulk_buffer.is_empty() {
-        match read_bulk_metadata_entries(dir, bulk_buffer) {
+        match read_bulk_metadata_entries_confined(root, root_fd, dir, bulk_buffer) {
             Ok(mut entries) => {
                 entries.retain(|entry| !is_object_metadata_sidecar_name(root, dir, &entry.name));
                 for entry in &mut entries {
@@ -497,7 +980,12 @@ fn read_object_tree_entries_for_walk(
     }
     #[cfg(not(target_os = "macos"))]
     let _ = bulk_buffer;
-    read_object_tree_entries(root, dir)
+    read_object_tree_entries_with_root(
+        root,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        root_fd,
+        dir,
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -513,8 +1001,15 @@ fn refresh_bulk_symlink_metadata(dir: &Path, entry: &mut ObjectTreeEntry) -> Res
     Ok(())
 }
 
+#[cfg_attr(
+    any(target_os = "linux", target_os = "macos"),
+    expect(clippy::too_many_arguments)
+)]
 fn hash_object_tree_dir_inner(
     root: &Path,
+    #[cfg(any(target_os = "linux", target_os = "macos"))] root_fd: Option<
+        std::os::fd::BorrowedFd<'_>,
+    >,
     dir: &Path,
     relative: &mut Vec<u8>,
     mut content_hasher: Option<&mut TreeContentHasher<'_>>,
@@ -522,7 +1017,13 @@ fn hash_object_tree_dir_inner(
     mut stats: Option<&mut ObjectTreeStats>,
     bulk_buffer: &mut Vec<u8>,
 ) -> Result<(), LpmError> {
-    let entries = read_object_tree_entries_for_walk(root, dir, bulk_buffer)?;
+    let entries = read_object_tree_entries_for_walk(
+        root,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        root_fd,
+        dir,
+        bulk_buffer,
+    )?;
 
     let mut path = dir.to_path_buf();
     for entry in entries {
@@ -565,6 +1066,8 @@ fn hash_object_tree_dir_inner(
             metadata_hasher.update_record(b"dir", relative.as_slice(), metadata, &[]);
             hash_object_tree_dir_inner(
                 root,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                root_fd,
                 &path,
                 relative,
                 content_hasher.as_deref_mut(),
@@ -620,19 +1123,24 @@ enum ObjectTreeEntryKind {
     Unsupported,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn read_bulk_metadata_entries(
+    dir: &Path,
+    buffer: &mut [u8],
+) -> Result<Vec<ObjectTreeEntry>, LpmError> {
+    read_bulk_metadata_entries_confined(dir, None, dir, buffer)
+}
+
+#[cfg(target_os = "macos")]
+fn read_bulk_metadata_entries_confined(
+    root: &Path,
+    root_fd: Option<std::os::fd::BorrowedFd<'_>>,
     dir: &Path,
     buffer: &mut [u8],
 ) -> Result<Vec<ObjectTreeEntry>, LpmError> {
     use std::os::fd::AsRawFd;
 
-    let directory = std::fs::File::open(dir).map_err(|error| {
-        LpmError::Store(format!(
-            "failed to read virtual-store object tree at {}: {error}",
-            dir.display()
-        ))
-    })?;
+    let directory = open_dir_confined_fd(root, root_fd, dir)?;
     let mut attributes = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
@@ -859,6 +1367,7 @@ struct ObjectTreeEntry {
     change_time_nanos: i128,
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 impl ObjectTreeEntry {
     fn from_metadata(name: OsString, metadata: &std::fs::Metadata) -> Self {
         let kind = if is_symlink_or_junction(metadata) {
@@ -1233,7 +1742,9 @@ mod tests {
     fn fixture_file(path: &str, content: &[u8]) -> ExtractedFileDigest {
         ExtractedFileDigest {
             relative_path: path.into(),
+            size: content.len() as u64,
             blake3_digest: *blake3::hash(content).as_bytes(),
+            source_stamp: None,
         }
     }
 
@@ -1247,6 +1758,29 @@ mod tests {
         push_os_str_bytes(&mut expected, OsStr::new("child"));
 
         assert_eq!(relative_path_bytes(root, &path).unwrap(), expected);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn read_object_tree_entries_rejects_symlinked_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("object");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"outside").unwrap();
+        let symlink_sub = root.join("sub");
+        std::os::unix::fs::symlink(&outside, &symlink_sub).unwrap();
+
+        let err = match read_object_tree_entries(&root, &symlink_sub) {
+            Ok(_) => panic!("descending through a symlinked subdirectory must be refused"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("failed to read virtual-store object tree"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1432,7 +1966,9 @@ mod tests {
         ];
         files.push(ExtractedFileDigest {
             relative_path: unicode_path,
+            size: b"unicode".len() as u64,
             blake3_digest: *blake3::hash(b"unicode").as_bytes(),
+            source_stamp: None,
         });
         let actual = finish_with_bulk_walk(root, files, 3).unwrap();
         let expected =
@@ -1475,6 +2011,7 @@ mod tests {
             }
             hash_object_tree_dir_inner(
                 root,
+                None,
                 &path,
                 &mut relative,
                 Some(&mut content),
@@ -1531,6 +2068,7 @@ mod tests {
             let mut buffer = vec![0];
             let walked = hash_object_tree_dir_inner(
                 dir.path(),
+                None,
                 dir.path(),
                 &mut Vec::new(),
                 Some(&mut content),
@@ -1617,5 +2155,71 @@ mod tests {
         let mut encoded = Vec::new();
         push_os_str_bytes(&mut encoded, &entry.name);
         assert_eq!(encoded, b"file-\xff");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix_fstatat_tree_entries_match_portable_read_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+        std::fs::write(dir.path().join("index.js"), b"export default 42;\n").unwrap();
+        let bin = dir.path().join("cli.sh");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("index.js", dir.path().join("alias.js")).unwrap();
+        std::fs::write(dir.path().join(".integrity"), b"sha512-ignored").unwrap();
+
+        let fast = read_object_tree_entries_fstatat(dir.path(), dir.path()).unwrap();
+        let portable = read_object_tree_entries_portable(dir.path(), dir.path()).unwrap();
+        assert_eq!(fast.len(), portable.len());
+        assert_eq!(fast.len(), 4);
+        for (a, b) in fast.iter().zip(&portable) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.mode, b.mode);
+            assert_eq!(a.len, b.len);
+            assert_eq!(a.modified_time_nanos, b.modified_time_nanos);
+            assert_eq!(a.change_time_nanos, b.change_time_nanos);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bulk_metadata_reader_rejects_symlinked_subdirectories() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.js"), b"outside").unwrap();
+        let link = root.path().join("sub");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let mut buf = vec![0_u8; 64 * 1024];
+        let result = read_bulk_metadata_entries(&link, &mut buf);
+        assert!(
+            result.is_err(),
+            "macOS bulk metadata reader must open directories with O_NOFOLLOW and reject symlinks"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn confined_tree_reader_rejects_symlinked_intermediate_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("inner")).unwrap();
+        std::fs::write(outside.path().join("inner/secret.js"), b"outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("sub")).unwrap();
+
+        let root_fd = open_root_dir_fd(root.path()).unwrap();
+        let result = read_object_tree_entries_fstatat_with_root(
+            root.path(),
+            Some(std::os::fd::AsFd::as_fd(&root_fd)),
+            &root.path().join("sub/inner"),
+        );
+        assert!(
+            result.is_err(),
+            "confined tree reader must reject symlinked intermediate directories"
+        );
     }
 }

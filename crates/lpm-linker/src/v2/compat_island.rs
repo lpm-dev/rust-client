@@ -162,17 +162,15 @@ fn collect_project_package_bin_names(
             Err(lpm_common::BoundedReadError::NotFound { .. }) => return Some(()),
             Err(_) => return None,
         };
-    const BIN_KEY: &[u8] = b"\"bin\"";
-    if !content.windows(BIN_KEY.len()).any(|w| w == BIN_KEY) {
+    if !lpm_workspace::manifest_bytes_may_contain_bin(&content) {
         return Some(());
     }
-    let bin_config = match lpm_workspace::parse_bin_field(&content) {
-        Ok(Some(bin_config)) => bin_config,
-        Ok(None) => return Some(()),
+    let (manifest_name, bin_config) = match lpm_workspace::parse_name_and_bin_field(&content) {
+        Ok((name, Some(bin_config))) => (name, bin_config),
+        Ok((_, None)) => return Some(()),
         Err(_) => return None,
     };
-    let package_name =
-        package_name_from_manifest(&content).unwrap_or_else(|| fallback_package_name.to_string());
+    let package_name = manifest_name.unwrap_or_else(|| fallback_package_name.to_string());
     if manifest_needs_bin_compatibility(&content) {
         bin_names.extend(
             bin_config
@@ -184,17 +182,25 @@ fn collect_project_package_bin_names(
     Some(())
 }
 
-fn package_name_from_manifest(content: &[u8]) -> Option<String> {
-    let parsed: serde_json::Value =
-        serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(content)).ok()?;
-    parsed.get("name")?.as_str().map(str::to_string)
-}
-
 pub(super) fn manifest_needs_bin_compatibility(content: &[u8]) -> bool {
     const DEPS_KEY: &[u8] = b"\"dependencies\"";
     const PEERS_KEY: &[u8] = b"\"peerDependencies\"";
-    content.windows(DEPS_KEY.len()).any(|w| w == DEPS_KEY)
+    if content.windows(DEPS_KEY.len()).any(|w| w == DEPS_KEY)
         || content.windows(PEERS_KEY.len()).any(|w| w == PEERS_KEY)
+    {
+        return true;
+    }
+    if !content.windows(2).any(|w| w == b"\\u") {
+        return false;
+    }
+    let trimmed = content.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(content);
+    match serde_json::from_slice::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(map)) => {
+            map.contains_key("dependencies") || map.contains_key("peerDependencies")
+        }
+        Ok(_) => false,
+        Err(_) => true,
+    }
 }
 
 pub(super) fn create_project_compatibility_links(
@@ -204,6 +210,7 @@ pub(super) fn create_project_compatibility_links(
     key_map: &KeyMap,
     compatibility_bin_names: &[String],
     refresh_package_copies: bool,
+    warm_link_keys: Option<&HashSet<String>>,
 ) -> Result<CompatibilityLinks, LpmError> {
     let requested_bins = normalize_compatibility_bin_names(compatibility_bin_names);
 
@@ -234,6 +241,7 @@ pub(super) fn create_project_compatibility_links(
             key_map,
             &entries,
             refresh_package_copies,
+            warm_link_keys,
         )
     }
     #[cfg(not(target_os = "macos"))]
@@ -244,6 +252,7 @@ pub(super) fn create_project_compatibility_links(
             key_map,
             &entries,
             refresh_package_copies,
+            warm_link_keys,
         )
     }
 }
@@ -257,7 +266,10 @@ fn build_compat_island_at(
     store: &Store,
     key_map: &KeyMap,
     refresh_package_copies: bool,
+    warm_link_keys: Option<&HashSet<String>>,
 ) -> Result<CompatibilityLinks, LpmError> {
+    let is_warm_source =
+        |key: &GraphKey| warm_link_keys.is_some_and(|keys| keys.contains(key.dir_name()));
     #[cfg(target_os = "macos")]
     {
         let mut compatibility_links = CompatibilityLinks::with_capacity(entries.len());
@@ -267,6 +279,7 @@ fn build_compat_island_at(
                 entry,
                 store,
                 refresh_package_copies,
+                is_warm_source(&entry.key),
             )?;
             compatibility_links.insert(&entry.key, package_dir);
         }
@@ -286,35 +299,116 @@ fn build_compat_island_at(
 
     #[cfg(not(target_os = "macos"))]
     {
-        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         const PARALLEL_COMPAT_THRESHOLD: usize = 4;
+        let max_workers = if store.uses_serialized_volume_metadata() {
+            lpm_common::resources::effective_cpu_count().clamp(1, 2)
+        } else {
+            lpm_common::resources::effective_cpu_count().clamp(1, 8)
+        };
         let mut compatibility_links = CompatibilityLinks::with_capacity(entries.len());
-        if entries.len() >= PARALLEL_COMPAT_THRESHOLD {
-            let copied: Vec<(&GraphKey, PathBuf)> = entries
-                .par_iter()
-                .map(|entry| {
-                    let package_dir = ensure_compatibility_package_copy(
+        if entries.len() >= PARALLEL_COMPAT_THRESHOLD && max_workers > 1 {
+            let desired_helpers = max_workers.min(entries.len()).saturating_sub(1);
+            let next_copy = AtomicUsize::new(0);
+            let copy_failed = AtomicBool::new(false);
+            let run_copy_worker = || -> Result<Vec<(&GraphKey, PathBuf)>, LpmError> {
+                let mut local = Vec::new();
+                while !copy_failed.load(Ordering::Relaxed) {
+                    let idx = next_copy.fetch_add(1, Ordering::Relaxed);
+                    let Some(entry) = entries.get(idx) else {
+                        break;
+                    };
+                    match ensure_compatibility_package_copy(
                         compatibility_root,
                         entry,
                         store,
                         refresh_package_copies,
-                    )?;
-                    Ok((entry.key.as_ref(), package_dir))
-                })
-                .collect::<Result<Vec<_>, LpmError>>()?;
-            for (key, package_dir) in copied {
-                compatibility_links.insert(key, package_dir);
+                        is_warm_source(&entry.key),
+                    ) {
+                        Ok(package_dir) => local.push((entry.key.as_ref(), package_dir)),
+                        Err(error) => {
+                            copy_failed.store(true, Ordering::Relaxed);
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(local)
+            };
+            let copied_chunks: Vec<Result<Vec<(&GraphKey, PathBuf)>, LpmError>> =
+                std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(desired_helpers);
+                    for _ in 0..desired_helpers {
+                        match std::thread::Builder::new().spawn_scoped(scope, run_copy_worker) {
+                            Ok(handle) => handles.push(handle),
+                            Err(_) => break,
+                        }
+                    }
+                    let local = run_copy_worker();
+                    let mut outputs = Vec::with_capacity(handles.len() + 1);
+                    outputs.push(local);
+                    for handle in handles {
+                        outputs.push(match handle.join() {
+                            Ok(result) => result,
+                            Err(_) => Err(LpmError::Store(
+                                "compatibility island copy worker panicked".into(),
+                            )),
+                        });
+                    }
+                    outputs
+                });
+            for chunk in copied_chunks {
+                for (key, package_dir) in chunk? {
+                    compatibility_links.insert(key, package_dir);
+                }
             }
-            entries.par_iter().try_for_each(|entry| {
-                sync_compatibility_entry_links(
-                    compatibility_root,
-                    entry,
-                    key_map,
-                    &compatibility_links,
-                )?;
-                write_compatibility_marker(compatibility_root, entry)
-            })?;
+            let compat_links_ref = &compatibility_links;
+            let next_link = AtomicUsize::new(0);
+            let link_failed = AtomicBool::new(false);
+            let run_link_worker = || -> Result<(), LpmError> {
+                while !link_failed.load(Ordering::Relaxed) {
+                    let idx = next_link.fetch_add(1, Ordering::Relaxed);
+                    let Some(entry) = entries.get(idx) else {
+                        break;
+                    };
+                    if let Err(error) = sync_compatibility_entry_links(
+                        compatibility_root,
+                        entry,
+                        key_map,
+                        compat_links_ref,
+                    )
+                    .and_then(|()| write_compatibility_marker(compatibility_root, entry))
+                    {
+                        link_failed.store(true, Ordering::Relaxed);
+                        return Err(error);
+                    }
+                }
+                Ok(())
+            };
+            let link_results: Vec<Result<(), LpmError>> = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(desired_helpers);
+                for _ in 0..desired_helpers {
+                    match std::thread::Builder::new().spawn_scoped(scope, run_link_worker) {
+                        Ok(handle) => handles.push(handle),
+                        Err(_) => break,
+                    }
+                }
+                let local = run_link_worker();
+                let mut outputs = Vec::with_capacity(handles.len() + 1);
+                outputs.push(local);
+                for handle in handles {
+                    outputs.push(match handle.join() {
+                        Ok(result) => result,
+                        Err(_) => Err(LpmError::Store(
+                            "compatibility island link worker panicked".into(),
+                        )),
+                    });
+                }
+                outputs
+            });
+            for result in link_results {
+                result?;
+            }
         } else {
             for entry in entries {
                 let package_dir = ensure_compatibility_package_copy(
@@ -322,6 +416,7 @@ fn build_compat_island_at(
                     entry,
                     store,
                     refresh_package_copies,
+                    is_warm_source(&entry.key),
                 )?;
                 compatibility_links.insert(&entry.key, package_dir);
             }
@@ -351,6 +446,7 @@ fn create_project_compatibility_links_in_place(
     key_map: &KeyMap,
     entries: &[CompatibilityEntry<'_>],
     refresh_package_copies: bool,
+    warm_link_keys: Option<&HashSet<String>>,
 ) -> Result<CompatibilityLinks, LpmError> {
     let compatibility_root = ensure_project_compatibility_root(project_dir)?;
     let desired: HashSet<String> = entries
@@ -364,6 +460,7 @@ fn create_project_compatibility_links_in_place(
         store,
         key_map,
         refresh_package_copies,
+        warm_link_keys,
     )
 }
 
@@ -379,6 +476,7 @@ fn create_project_compatibility_links_store_cached(
     key_map: &KeyMap,
     entries: &[CompatibilityEntry<'_>],
     refresh_package_copies: bool,
+    warm_link_keys: Option<&HashSet<String>>,
 ) -> Result<CompatibilityLinks, LpmError> {
     let island_key = store_compat_island_key(entries, store)?;
     let _island_lock = store.acquire_build_entry_lock(&island_key)?;
@@ -389,6 +487,7 @@ fn create_project_compatibility_links_store_cached(
         store,
         key_map,
         refresh_package_copies,
+        warm_link_keys,
     )?;
 
     let compatibility_root = materialize_island_into_project(project_dir, &store_island)?;
@@ -437,6 +536,7 @@ fn ensure_store_compat_island(
     store: &Store,
     key_map: &KeyMap,
     force_refresh: bool,
+    warm_link_keys: Option<&HashSet<String>>,
 ) -> Result<(), LpmError> {
     if !force_refresh && store_compat_island_complete(store_island, entries, store, key_map) {
         // Reuse: refresh the sentinel's mtime so `lpm cache prune
@@ -457,7 +557,7 @@ fn ensure_store_compat_island(
 
     let tmp = create_store_compatibility_tmp_dir(store_island)?;
     let build = (|| -> Result<(), LpmError> {
-        build_compat_island_at(&tmp, entries, store, key_map, true)?;
+        build_compat_island_at(&tmp, entries, store, key_map, true, warm_link_keys)?;
         // Completion sentinel written last; the atomic rename below only
         // publishes a tmp that reached this point.
         write_store_compat_island_completion(&tmp, entries, store).map_err(|e| {
@@ -1054,8 +1154,7 @@ fn collect_compatibility_roots_for_bins<'a>(
                 continue;
             }
         };
-        const BIN_KEY: &[u8] = b"\"bin\"";
-        if !content.windows(BIN_KEY.len()).any(|w| w == BIN_KEY) {
+        if !lpm_workspace::manifest_bytes_may_contain_bin(&content) {
             continue;
         }
         let bin_config = match lpm_workspace::parse_bin_field(&content) {
@@ -1324,6 +1423,7 @@ fn ensure_compatibility_package_copy(
     entry: &CompatibilityEntry<'_>,
     store: &Store,
     force_refresh: bool,
+    warm_source: bool,
 ) -> Result<PathBuf, LpmError> {
     let final_dir = compatibility_entry_dir(compatibility_root, &entry.key);
     let package_dir = compatibility_package_dir(compatibility_root, &entry.key);
@@ -1345,7 +1445,7 @@ fn ensure_compatibility_package_copy(
         )));
     }
 
-    if let Err(error) = copy_dir_recursive(&source_package_dir, &tmp_package_dir) {
+    if let Err(error) = copy_dir_recursive(&source_package_dir, &tmp_package_dir, warm_source) {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(error);
     }
@@ -1730,6 +1830,7 @@ mod tests {
             &store,
             &key_map,
             false,
+            None,
         )
         .unwrap();
 
@@ -1889,13 +1990,27 @@ mod tests {
 
 #[cfg(test)]
 mod manifest_tests {
-    use super::package_name_from_manifest;
-
     #[test]
     fn package_name_is_read_from_a_manifest_with_a_byte_order_mark() {
-        assert_eq!(
-            package_name_from_manifest(b"\xEF\xBB\xBF{\"name\":\"marked\"}").as_deref(),
-            Some("marked")
-        );
+        let (name, bin) =
+            lpm_workspace::parse_name_and_bin_field(b"\xEF\xBB\xBF{\"name\":\"marked\"}").unwrap();
+        assert_eq!(name.as_deref(), Some("marked"));
+        assert!(bin.is_none());
+    }
+
+    #[test]
+    fn manifest_needs_bin_compatibility_handles_unicode_escaped_dependency_keys() {
+        assert!(super::manifest_needs_bin_compatibility(
+            br#"{"name":"cli","bin":"./cli.js","dep\u0065ndencies":{"a":"1.0.0"}}"#
+        ));
+        assert!(super::manifest_needs_bin_compatibility(
+            br#"{"name":"cli","bin":"./cli.js","peerDep\u0065ndencies":{"a":"1.0.0"}}"#
+        ));
+        assert!(!super::manifest_needs_bin_compatibility(
+            br#"{"name":"cli","bin":"./cli.js","version":"1.0.0"}"#
+        ));
+        assert!(!super::manifest_needs_bin_compatibility(
+            br#"{"name":"cli","bin":"./cli.js","description":"caf\u00e9"}"#
+        ));
     }
 }

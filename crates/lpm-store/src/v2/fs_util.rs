@@ -5,6 +5,7 @@ use lpm_common::{LpmError, is_symlink_or_junction};
 use super::integrity::has_local_source_sentinel;
 use super::tree_hash::{
     TreeMetadataBuilder, TreeMetadataDigests, TreeMetadataKind, is_object_metadata_sidecar,
+    is_object_metadata_sidecar_name,
 };
 
 pub(crate) fn tmp_sibling(dir: &Path) -> PathBuf {
@@ -322,17 +323,24 @@ pub(crate) fn materialize_into_with_integrity(
     dst: &Path,
     allow_source_symlinks: bool,
     warm_source: bool,
+    allow_parallel_files: bool,
 ) -> Result<Option<TreeMetadataDigests>, LpmError> {
     #[cfg(target_os = "macos")]
     {
-        let _ = warm_source;
+        let _ = (warm_source, allow_parallel_files);
         if try_clonefile(src, dst) {
             remove_materialized_object_sidecars(dst)?;
             return Ok(None);
         }
     }
-    materialize_into_portable_with_integrity_inner(src, dst, allow_source_symlinks, warm_source)
-        .map(Some)
+    materialize_into_portable_with_integrity_inner(
+        src,
+        dst,
+        allow_source_symlinks,
+        warm_source,
+        allow_parallel_files,
+    )
+    .map(Some)
 }
 
 fn materialize_into_portable_with_integrity_inner(
@@ -340,6 +348,7 @@ fn materialize_into_portable_with_integrity_inner(
     dst: &Path,
     allow_source_symlinks: bool,
     warm_source: bool,
+    allow_parallel_files: bool,
 ) -> Result<TreeMetadataDigests, LpmError> {
     let mut metadata = TreeMetadataBuilder::new();
     materialize_into_inner_impl(
@@ -350,6 +359,7 @@ fn materialize_into_portable_with_integrity_inner(
         allow_source_symlinks,
         false,
         warm_source,
+        allow_parallel_files,
         Some(&mut metadata),
     )?;
     Ok(metadata.finish())
@@ -360,8 +370,14 @@ pub(crate) fn materialize_into_portable_with_integrity(
     src: &Path,
     dst: &Path,
 ) -> Result<String, LpmError> {
-    materialize_into_portable_with_integrity_inner(src, dst, has_local_source_sentinel(src), false)
-        .map(|digests| digests.metadata)
+    materialize_into_portable_with_integrity_inner(
+        src,
+        dst,
+        has_local_source_sentinel(src),
+        false,
+        false,
+    )
+    .map(|digests| digests.metadata)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -369,8 +385,14 @@ pub(crate) fn materialize_into_portable_with_integrity_warm(
     src: &Path,
     dst: &Path,
 ) -> Result<String, LpmError> {
-    materialize_into_portable_with_integrity_inner(src, dst, has_local_source_sentinel(src), true)
-        .map(|digests| digests.metadata)
+    materialize_into_portable_with_integrity_inner(
+        src,
+        dst,
+        has_local_source_sentinel(src),
+        true,
+        false,
+    )
+    .map(|digests| digests.metadata)
 }
 
 #[cfg(all(test, unix))]
@@ -379,7 +401,7 @@ pub(crate) fn materialize_into_portable_with_integrity_and_symlink_policy(
     dst: &Path,
     allow_source_symlinks: bool,
 ) -> Result<String, LpmError> {
-    materialize_into_portable_with_integrity_inner(src, dst, allow_source_symlinks, false)
+    materialize_into_portable_with_integrity_inner(src, dst, allow_source_symlinks, false, false)
         .map(|digests| digests.metadata)
 }
 
@@ -389,8 +411,21 @@ pub(crate) fn materialize_into_inner(
     dst: &Path,
     allow_source_symlinks: bool,
 ) -> Result<(), LpmError> {
-    materialize_into_inner_impl(root, src, dst, dst, allow_source_symlinks, true, true, None)
+    materialize_into_inner_impl(
+        root,
+        src,
+        dst,
+        dst,
+        allow_source_symlinks,
+        true,
+        true,
+        false,
+        None,
+    )
 }
+
+const PARALLEL_MATERIALIZE_FILES_MIN: usize = 64;
+const PARALLEL_MATERIALIZE_MAX_WORKERS: usize = 4;
 
 #[allow(clippy::too_many_arguments)]
 fn materialize_into_inner_impl(
@@ -401,6 +436,7 @@ fn materialize_into_inner_impl(
     allow_source_symlinks: bool,
     allow_clonefile: bool,
     warm_source: bool,
+    allow_parallel_files: bool,
     mut tree_metadata: Option<&mut TreeMetadataBuilder>,
 ) -> Result<(), LpmError> {
     #[cfg(target_os = "macos")]
@@ -442,6 +478,105 @@ fn materialize_into_inner_impl(
     }
     entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
+    let regular_file_count = if allow_parallel_files {
+        entries
+            .iter()
+            .filter(|(name, ft)| {
+                !ft.is_dir()
+                    && !ft.is_symlink()
+                    && !is_object_metadata_sidecar_name(root, src, name)
+            })
+            .count()
+    } else {
+        0
+    };
+    let parallel_workers = if regular_file_count >= PARALLEL_MATERIALIZE_FILES_MIN {
+        lpm_common::resources::effective_cpu_count().clamp(1, PARALLEL_MATERIALIZE_MAX_WORKERS)
+    } else {
+        1
+    };
+
+    if parallel_workers > 1 {
+        let mut regular_files = Vec::with_capacity(regular_file_count);
+        let mut regular_slots = Vec::with_capacity(entries.len());
+        for (idx, (name, file_type)) in entries.iter().enumerate() {
+            if is_object_metadata_sidecar_name(root, src, name) {
+                regular_slots.push(None);
+                continue;
+            }
+            if !file_type.is_dir() && !file_type.is_symlink() {
+                let slot = regular_files.len();
+                regular_files.push((src.join(name), dst.join(name)));
+                regular_slots.push(Some(slot));
+            } else {
+                regular_slots.push(None);
+            }
+            let _ = idx;
+        }
+        let parallel_results =
+            materialize_regular_files_parallel(&regular_files, warm_source, parallel_workers)?;
+        for ((name, file_type), regular_slot) in entries.into_iter().zip(regular_slots) {
+            if is_object_metadata_sidecar_name(root, src, &name) {
+                continue;
+            }
+            if let Some(slot) = regular_slot {
+                let (_, dst_path) = &regular_files[slot];
+                if let Some(metadata) = tree_metadata.as_deref_mut() {
+                    if let Some(dst_meta) = &parallel_results[slot] {
+                        metadata.record_with_metadata(
+                            destination_root,
+                            dst_path,
+                            TreeMetadataKind::File,
+                            dst_meta,
+                            Vec::new(),
+                        )?;
+                    } else {
+                        metadata.record(
+                            destination_root,
+                            dst_path,
+                            TreeMetadataKind::File,
+                            Vec::new(),
+                        )?;
+                    }
+                }
+                continue;
+            }
+            let src_path = src.join(&name);
+            let dst_path = dst.join(&name);
+            if file_type.is_dir() {
+                let record = tree_metadata
+                    .as_deref_mut()
+                    .map(|metadata| {
+                        metadata.reserve(destination_root, &dst_path, TreeMetadataKind::Directory)
+                    })
+                    .transpose()?;
+                materialize_into_inner_impl(
+                    root,
+                    &src_path,
+                    &dst_path,
+                    destination_root,
+                    allow_source_symlinks,
+                    allow_clonefile,
+                    warm_source,
+                    allow_parallel_files,
+                    tree_metadata.as_deref_mut(),
+                )?;
+                if let (Some(metadata), Some(record)) = (tree_metadata.as_deref_mut(), record) {
+                    metadata.refresh(record, &dst_path, Vec::new())?;
+                }
+            } else if file_type.is_symlink() {
+                materialize_symlink_entry(
+                    &src_path,
+                    &dst_path,
+                    destination_root,
+                    allow_source_symlinks,
+                    tree_metadata.as_deref_mut(),
+                )?;
+            }
+        }
+        return Ok(());
+    }
+
     for (name, file_type) in entries {
         let src_path = src.join(&name);
         if is_object_metadata_sidecar(root, &src_path) {
@@ -464,45 +599,20 @@ fn materialize_into_inner_impl(
                 allow_source_symlinks,
                 allow_clonefile,
                 warm_source,
+                allow_parallel_files,
                 tree_metadata.as_deref_mut(),
             )?;
             if let (Some(metadata), Some(record)) = (tree_metadata.as_deref_mut(), record) {
                 metadata.refresh(record, &dst_path, Vec::new())?;
             }
         } else if file_type.is_symlink() {
-            if !allow_source_symlinks {
-                // Refuse symlink entries — the extractor's `is_file()`
-                // filter blocks them at extract time, so a symlink under
-                // `objects/` means a same-UID actor planted it. Symmetric
-                // with the v1→v2 `copy_dir_recursively` refusal.
-                let target = std::fs::read_link(&src_path).unwrap_or_default();
-                return Err(LpmError::Store(format!(
-                    "refusing virtual-store symlink entry {} → {}; symlinks must not appear under objects/",
-                    src_path.display(),
-                    target.display(),
-                )));
-            }
-            let target = std::fs::read_link(&src_path).map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to read virtual-store local-source symlink {}: {e}",
-                    src_path.display()
-                ))
-            })?;
-            create_fs_symlink(&target, &dst_path).map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to recreate virtual-store local-source symlink {} → {}: {e}",
-                    dst_path.display(),
-                    target.display()
-                ))
-            })?;
-            if let Some(metadata) = tree_metadata.as_deref_mut() {
-                metadata.record(
-                    destination_root,
-                    &dst_path,
-                    TreeMetadataKind::Symlink,
-                    os_str_bytes(target.as_os_str()),
-                )?;
-            }
+            materialize_symlink_entry(
+                &src_path,
+                &dst_path,
+                destination_root,
+                allow_source_symlinks,
+                tree_metadata.as_deref_mut(),
+            )?;
         } else {
             let file_metadata = materialize_regular_file(&src_path, &dst_path, warm_source)?;
             if let Some(metadata) = tree_metadata.as_deref_mut() {
@@ -531,6 +641,160 @@ fn materialize_into_inner_impl(
     Ok(())
 }
 
+fn materialize_symlink_entry(
+    src_path: &Path,
+    dst_path: &Path,
+    destination_root: &Path,
+    allow_source_symlinks: bool,
+    tree_metadata: Option<&mut TreeMetadataBuilder>,
+) -> Result<(), LpmError> {
+    if !allow_source_symlinks {
+        let target = std::fs::read_link(src_path).unwrap_or_default();
+        return Err(LpmError::Store(format!(
+            "refusing virtual-store symlink entry {} → {}; symlinks must not appear under objects/",
+            src_path.display(),
+            target.display(),
+        )));
+    }
+    let target = std::fs::read_link(src_path).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to read virtual-store local-source symlink {}: {e}",
+            src_path.display()
+        ))
+    })?;
+    create_fs_symlink(&target, dst_path).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to recreate virtual-store local-source symlink {} → {}: {e}",
+            dst_path.display(),
+            target.display()
+        ))
+    })?;
+    if let Some(metadata) = tree_metadata {
+        metadata.record(
+            destination_root,
+            dst_path,
+            TreeMetadataKind::Symlink,
+            os_str_bytes(target.as_os_str()),
+        )?;
+    }
+    Ok(())
+}
+
+static ACTIVE_MATERIALIZE_HELPERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct MaterializeHelperSlot;
+
+impl MaterializeHelperSlot {
+    fn try_acquire(cap: usize) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+
+        ACTIVE_MATERIALIZE_HELPERS
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < cap).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for MaterializeHelperSlot {
+    fn drop(&mut self) {
+        ACTIVE_MATERIALIZE_HELPERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_MATERIALIZE_SPAWN_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+type MaterializeWorkerResult = Result<Vec<(usize, Option<std::fs::Metadata>)>, LpmError>;
+
+fn spawn_materialize_helper<'scope, 'env, F>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    f: F,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, MaterializeWorkerResult>>
+where
+    F: FnOnce() -> MaterializeWorkerResult + Send + 'scope,
+{
+    #[cfg(test)]
+    if FORCE_MATERIALIZE_SPAWN_FAILURE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "injected materialize worker spawn failure",
+        ));
+    }
+    std::thread::Builder::new().spawn_scoped(scope, f)
+}
+
+fn materialize_regular_files_parallel(
+    files: &[(PathBuf, PathBuf)],
+    warm_source: bool,
+    workers: usize,
+) -> Result<Vec<Option<std::fs::Metadata>>, LpmError> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let global_helper_cap = lpm_common::resources::effective_cpu_count().clamp(2, 8);
+    let desired_helpers = workers.min(files.len()).saturating_sub(1);
+    let next_index = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+
+    let run_worker = || -> MaterializeWorkerResult {
+        let mut local = Vec::new();
+        while !failed.load(Ordering::Relaxed) {
+            let idx = next_index.fetch_add(1, Ordering::Relaxed);
+            let Some((src_path, dst_path)) = files.get(idx) else {
+                break;
+            };
+            match materialize_regular_file(src_path, dst_path, warm_source) {
+                Ok(meta) => local.push((idx, meta)),
+                Err(error) => {
+                    failed.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(local)
+    };
+
+    let worker_outputs: Vec<MaterializeWorkerResult> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(desired_helpers);
+        for _ in 0..desired_helpers {
+            let Some(slot) = MaterializeHelperSlot::try_acquire(global_helper_cap) else {
+                break;
+            };
+            match spawn_materialize_helper(scope, move || {
+                let _slot = slot;
+                run_worker()
+            }) {
+                Ok(handle) => handles.push(handle),
+                Err(_) => break,
+            }
+        }
+        let local_result = run_worker();
+        let mut outputs = Vec::with_capacity(handles.len() + 1);
+        outputs.push(local_result);
+        for handle in handles {
+            outputs.push(match handle.join() {
+                Ok(res) => res,
+                Err(_) => Err(LpmError::Store(
+                    "virtual-store parallel file materialization panicked".into(),
+                )),
+            });
+        }
+        outputs
+    });
+
+    let mut results: Vec<Option<std::fs::Metadata>> = vec![None; files.len()];
+    for output in worker_outputs {
+        for (idx, meta) in output? {
+            results[idx] = meta;
+        }
+    }
+    Ok(results)
+}
+
 fn materialize_regular_file(
     src: &Path,
     dst: &Path,
@@ -540,7 +804,12 @@ fn materialize_regular_file(
     {
         linux_copy::copy_file_with_metadata(src, dst, warm_source)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        let _ = warm_source;
+        windows_copy_file_with_metadata(src, dst)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = warm_source;
         std::fs::copy(src, dst).map_err(|copy_err| {
@@ -552,6 +821,120 @@ fn materialize_regular_file(
         })?;
         Ok(None)
     }
+}
+
+/// Copy small regular files (`<= 64 KiB`) on Windows via open handles so we
+/// can read the settled destination metadata directly from the destination
+/// handle without a follow-up path stat; larger files delegate to `CopyFileExW`
+/// via `std::fs::copy`.
+#[cfg(windows)]
+fn windows_copy_file_with_metadata(
+    src: &Path,
+    dst: &Path,
+) -> Result<Option<std::fs::Metadata>, LpmError> {
+    use std::io::{Read as _, Write as _};
+
+    const WINDOWS_SMALL_COPY_MAX_BYTES: u64 = 64 * 1024;
+    let mut source = std::fs::File::open(src).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to open virtual-store source file {} → {}: {e}",
+            src.display(),
+            dst.display()
+        ))
+    })?;
+    let source_meta = source.metadata().map_err(|e| {
+        LpmError::Store(format!(
+            "failed to inspect virtual-store source file {} → {}: {e}",
+            src.display(),
+            dst.display()
+        ))
+    })?;
+    if !source_meta.is_file() || source_meta.len() > WINDOWS_SMALL_COPY_MAX_BYTES {
+        drop(source);
+        std::fs::copy(src, dst).map_err(|copy_err| {
+            LpmError::Store(format!(
+                "failed to copy virtual-store source file {} → {}: {copy_err}",
+                src.display(),
+                dst.display()
+            ))
+        })?;
+        return Ok(None);
+    }
+    let expected_len = source_meta.len() as usize;
+    let readonly = source_meta.permissions().readonly();
+    thread_local! {
+        static SMALL_COPY_BUF: std::cell::RefCell<Vec<u8>> =
+            std::cell::RefCell::new(vec![0u8; WINDOWS_SMALL_COPY_MAX_BYTES as usize + 1]);
+    }
+    SMALL_COPY_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        let mut copied = 0usize;
+        while copied < expected_len {
+            match source.read(&mut buf[copied..=expected_len]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    copied += n;
+                    if copied > expected_len {
+                        return Err(LpmError::Store(format!(
+                            "virtual-store source file changed during copy: {}",
+                            src.display()
+                        )));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(LpmError::Store(format!(
+                        "failed to read virtual-store source file {} → {}: {error}",
+                        src.display(),
+                        dst.display()
+                    )));
+                }
+            }
+        }
+        if copied != expected_len {
+            return Err(LpmError::Store(format!(
+                "virtual-store source file truncated during copy: {}",
+                src.display()
+            )));
+        }
+        let mut destination = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dst)
+            .map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to create virtual-store file {} → {}: {e}",
+                    src.display(),
+                    dst.display()
+                ))
+            })?;
+        let written = (|| -> std::io::Result<()> {
+            if copied > 0 {
+                destination.write_all(&buf[..copied])?;
+            }
+            if readonly {
+                let mut perms = destination.metadata()?.permissions();
+                perms.set_readonly(true);
+                destination.set_permissions(perms)?;
+            }
+            Ok(())
+        })();
+        drop(destination);
+        match written {
+            // Return `None` so the caller stats `dst` after handle close, when
+            // Windows (NTFS, ReFS, SMB, shared folders) guarantees `LastWriteTime`
+            // has settled.
+            Ok(()) => Ok(None),
+            Err(error) => {
+                let _ = std::fs::remove_file(dst);
+                Err(LpmError::Store(format!(
+                    "failed to copy virtual-store source file {} → {}: {error}",
+                    src.display(),
+                    dst.display()
+                )))
+            }
+        }
+    })
 }
 
 #[cfg(unix)]
@@ -740,6 +1123,12 @@ pub(crate) mod linux_copy {
 
     pub fn copy_file_plain_io(src: &Path, dst: &Path) -> std::io::Result<()> {
         copy_file_io(src, dst, false)
+            .map(|_| ())
+            .map_err(|(_, error)| error)
+    }
+
+    pub fn copy_file_warm_plain_io(src: &Path, dst: &Path) -> std::io::Result<()> {
+        copy_file_io(src, dst, true)
             .map(|_| ())
             .map_err(|(_, error)| error)
     }
@@ -1206,5 +1595,44 @@ mod libc {
             dst: *const std::os::raw::c_char,
             flags: u32,
         ) -> std::os::raw::c_int;
+    }
+}
+
+#[cfg(test)]
+mod parallel_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn parallel_materialization_falls_back_serially_when_worker_spawn_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let mut files = Vec::new();
+        for idx in 0..80 {
+            let s = src.join(format!("f-{idx:03}.js"));
+            let d = dst.join(format!("f-{idx:03}.js"));
+            std::fs::write(&s, format!("export const x = {idx};\n")).unwrap();
+            files.push((s, d));
+        }
+
+        FORCE_MATERIALIZE_SPAWN_FAILURE.with(|flag| flag.set(true));
+        let res = materialize_regular_files_parallel(&files, false, 4);
+        FORCE_MATERIALIZE_SPAWN_FAILURE.with(|flag| flag.set(false));
+
+        let metas =
+            res.expect("spawn failure must fall back to serial execution without panicking");
+        assert_eq!(metas.len(), 80);
+        for (idx, (_, dst_path)) in files.iter().enumerate() {
+            assert_eq!(
+                std::fs::read_to_string(dst_path).unwrap(),
+                format!("export const x = {idx};\n")
+            );
+        }
+        assert_eq!(
+            ACTIVE_MATERIALIZE_HELPERS.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
     }
 }

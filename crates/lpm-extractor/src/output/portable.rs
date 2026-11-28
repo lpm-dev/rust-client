@@ -1,4 +1,4 @@
-use crate::{ExtractionRecord, PathLedgerBudget};
+use crate::{ExtractedFileStamp, ExtractionRecord, PathLedgerBudget};
 use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::{
     ambient_authority,
@@ -13,13 +13,107 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct Identity(lpm_common::FileIdentity);
+
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct Identity(u64, u64);
 
 impl Identity {
     fn from_cap(metadata: &cap_std::fs::Metadata) -> Self {
-        Self(metadata.dev(), metadata.ino())
+        #[cfg(windows)]
+        {
+            Self(lpm_common::FileIdentity {
+                volume: metadata.dev(),
+                file_id: u128::from(metadata.ino()),
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Self(metadata.dev(), metadata.ino())
+        }
     }
+
+    fn from_dir(dir: &Dir) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsHandle as _;
+            if let Ok(id) = lpm_common::FileIdentity::from_borrowed_handle(dir.as_handle()) {
+                return Ok(Self(id));
+            }
+        }
+        Ok(Self::from_cap(&dir.dir_metadata()?))
+    }
+
+    fn from_std_file(file: &File) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            if let Ok(id) = lpm_common::FileIdentity::from_open_file(file) {
+                return Ok(Self(id));
+            }
+        }
+        Ok(Self::from_cap(&cap_std::fs::Metadata::from_file(file)?))
+    }
+
+    fn from_regular_entry(dir: &Dir, name: &Path) -> io::Result<Option<Self>> {
+        #[cfg(windows)]
+        {
+            let mut options = OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            let file = dir.open_with(name, &options)?.into_std();
+            let meta = file.metadata()?;
+            if !meta.file_type().is_file() || lpm_common::is_symlink_or_junction(&meta) {
+                return Ok(None);
+            }
+            Ok(Some(Self::from_std_file(&file)?))
+        }
+        #[cfg(not(windows))]
+        {
+            let metadata = dir.symlink_metadata(name)?;
+            Ok(metadata.is_file().then(|| Self::from_cap(&metadata)))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_read_pin_nofollow(
+    dir: &Dir,
+    name: &Path,
+    expected_identity: Identity,
+) -> Result<File, LpmError> {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = dir.open_with(name, &options)?.into_std();
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file()
+        || lpm_common::is_symlink_or_junction(&meta)
+        || Identity::from_std_file(&file)? != expected_identity
+    {
+        return Err(LpmError::Registry(
+            "tarball output file changed before acceptance".into(),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn stamp_from_closed_writer_pin(pin: &File) -> Option<ExtractedFileStamp> {
+    let meta = pin.metadata().ok()?;
+    let stamp = lpm_common::windows_regular_file_stamp_from_open_file(pin)?;
+    let mode = if meta.permissions().readonly() {
+        0o444
+    } else {
+        0o644
+    };
+    Some(ExtractedFileStamp {
+        identity: stamp.identity,
+        size: stamp.len,
+        mode,
+        mtime_ns: stamp.mtime_ns,
+        ctime_ns: stamp.ctime_ns,
+    })
 }
 
 struct DirectoryRecord {
@@ -33,27 +127,143 @@ struct Parent {
     identity: Identity,
 }
 
+const MAX_CACHED_PARENTS: usize = 64;
+
+struct LruNode {
+    parent: Parent,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+struct ParentCache {
+    nodes: Vec<Option<LruNode>>,
+    free_slots: Vec<usize>,
+    index: HashMap<PathBuf, usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    capacity: usize,
+}
+
+impl ParentCache {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            nodes: Vec::with_capacity(capacity),
+            free_slots: Vec::new(),
+            index: HashMap::with_capacity(capacity),
+            head: None,
+            tail: None,
+            capacity,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.free_slots.clear();
+        self.index.clear();
+        self.head = None;
+        self.tail = None;
+    }
+
+    fn unlink(&mut self, slot: usize) -> Parent {
+        let node = self.nodes[slot].take().expect("LRU slot must be occupied");
+        match node.prev {
+            Some(prev) => {
+                if let Some(prev_node) = self.nodes[prev].as_mut() {
+                    prev_node.next = node.next;
+                }
+            }
+            None => self.head = node.next,
+        }
+        match node.next {
+            Some(next) => {
+                if let Some(next_node) = self.nodes[next].as_mut() {
+                    next_node.prev = node.prev;
+                }
+            }
+            None => self.tail = node.prev,
+        }
+        self.free_slots.push(slot);
+        node.parent
+    }
+
+    fn take(&mut self, path: &Path) -> Option<Parent> {
+        let slot = self.index.remove(path)?;
+        Some(self.unlink(slot))
+    }
+
+    fn insert(&mut self, parent: Parent) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let Some(existing) = self.index.remove(&parent.path) {
+            let _ = self.unlink(existing);
+        } else if self.index.len() >= self.capacity
+            && let Some(lru_slot) = self.tail
+        {
+            let evicted = self.unlink(lru_slot);
+            self.index.remove(&evicted.path);
+        }
+        let path_key = parent.path.clone();
+        let old_head = self.head;
+        let node = LruNode {
+            parent,
+            prev: None,
+            next: old_head,
+        };
+        let slot = if let Some(slot) = self.free_slots.pop() {
+            self.nodes[slot] = Some(node);
+            slot
+        } else {
+            let slot = self.nodes.len();
+            self.nodes.push(Some(node));
+            slot
+        };
+        if let Some(head_slot) = old_head
+            && let Some(head_node) = self.nodes[head_slot].as_mut()
+        {
+            head_node.prev = Some(slot);
+        } else {
+            self.tail = Some(slot);
+        }
+        self.head = Some(slot);
+        self.index.insert(path_key, slot);
+    }
+}
+
 pub(crate) struct OutputTree {
     root_path: PathBuf,
     visible_root_path: PathBuf,
     root: Arc<Dir>,
     root_identity: Identity,
     directories: HashMap<PathBuf, DirectoryRecord>,
+    directory_identities: HashMap<Identity, PathBuf>,
     parent: Option<Parent>,
+    recent_parents: ParentCache,
 }
 
 impl OutputTree {
     pub(crate) fn new(root_path: PathBuf, visible_root_path: PathBuf) -> Result<Self, LpmError> {
         let root = Dir::open_ambient_dir(&root_path, ambient_authority())?;
-        let root_identity = Identity::from_cap(&root.dir_metadata()?);
+        let root_identity = Identity::from_dir(&root)?;
+        let mut directory_identities = HashMap::with_capacity(64);
+        directory_identities.insert(root_identity, PathBuf::new());
         Ok(Self {
             root_path,
             visible_root_path,
             root: Arc::new(root),
             root_identity,
             directories: HashMap::with_capacity(64),
+            directory_identities,
             parent: None,
+            recent_parents: ParentCache::with_capacity(MAX_CACHED_PARENTS),
         })
+    }
+
+    fn park_current_parent(&mut self) {
+        let Some(previous) = self.parent.take() else {
+            return;
+        };
+        self.recent_parents.insert(previous);
     }
 
     pub(crate) fn prepare_parent(
@@ -63,7 +273,7 @@ impl OutputTree {
     ) -> Result<(), LpmError> {
         let parent = path.parent().unwrap_or(Path::new(""));
         if parent.as_os_str().is_empty() {
-            self.parent = None;
+            self.park_current_parent();
             return Ok(());
         }
         if self
@@ -73,7 +283,16 @@ impl OutputTree {
         {
             return Ok(());
         }
-        self.parent = None;
+        self.park_current_parent();
+        if let Some(cached) = self.recent_parents.take(parent)
+            && self
+                .directories
+                .get(parent)
+                .is_some_and(|record| record.identity == cached.identity)
+        {
+            self.parent = Some(cached);
+            return Ok(());
+        }
 
         let mut current = None::<Dir>;
         let mut prefix = PathBuf::with_capacity(parent.as_os_str().len());
@@ -98,17 +317,27 @@ impl OutputTree {
                 }
                 Err(error) => return Err(path_error(error, &prefix)),
             };
-            identity = Identity::from_cap(&next.dir_metadata()?);
+            identity = Identity::from_dir(&next)?;
             if let Some(record) = known {
                 if identity != record.identity {
                     return Err(changed_directory(&prefix));
                 }
             } else {
+                if let Some(existing_dir) = self.directory_identities.get(&identity)
+                    && existing_dir != &prefix
+                {
+                    return Err(LpmError::Registry(format!(
+                        "directory path collision in tarball: {} aliases {}",
+                        prefix.display(),
+                        existing_dir.display()
+                    )));
+                }
                 if !created {
                     budget.reserve(&prefix)?;
                 }
                 self.directories
                     .insert(prefix.clone(), DirectoryRecord { identity, created });
+                self.directory_identities.insert(identity, prefix.clone());
             }
             current = Some(next);
         }
@@ -149,11 +378,11 @@ impl OutputTree {
 
     fn validate_root(&self) -> Result<(), LpmError> {
         let current = Dir::open_ambient_dir(&self.root_path, ambient_authority())?;
-        if Identity::from_cap(&current.dir_metadata()?) != self.root_identity {
+        if Identity::from_dir(&current)? != self.root_identity {
             return Err(changed_directory(&self.root_path));
         }
         let visible = Dir::open_ambient_dir(&self.visible_root_path, ambient_authority())?;
-        if Identity::from_cap(&visible.dir_metadata()?) != self.root_identity {
+        if Identity::from_dir(&visible)? != self.root_identity {
             return Err(changed_directory(&self.visible_root_path));
         }
         Ok(())
@@ -165,7 +394,7 @@ impl OutputTree {
             let current = self
                 .open_recorded_directory(&parent.path)?
                 .ok_or_else(|| changed_directory(&parent.path))?;
-            if Identity::from_cap(&current.dir_metadata()?) != parent.identity {
+            if Identity::from_dir(&current)? != parent.identity {
                 return Err(changed_directory(&parent.path));
             }
         }
@@ -185,7 +414,7 @@ impl OutputTree {
             let next = base
                 .open_dir_nofollow(Path::new(component.as_os_str()))
                 .map_err(|error| path_error(error, &prefix))?;
-            if Identity::from_cap(&next.dir_metadata()?) != record.identity {
+            if Identity::from_dir(&next)? != record.identity {
                 return Err(changed_directory(&prefix));
             }
             current = Some(next);
@@ -195,9 +424,53 @@ impl OutputTree {
 
     pub(crate) fn validate(&mut self) -> Result<(), LpmError> {
         self.parent = None;
+        self.recent_parents.clear();
         self.validate_root()?;
-        for path in self.directories.keys() {
-            self.open_recorded_directory(path)?;
+        if self.directories.is_empty() {
+            return Ok(());
+        }
+        // Sort lexicographically so every recorded ancestor precedes its
+        // descendants, allowing each directory to be opened once from an
+        // already-validated parent handle instead of re-walking from root.
+        let mut paths: Vec<&Path> = self.directories.keys().map(PathBuf::as_path).collect();
+        paths.sort_unstable();
+        let mut stack: Vec<(&Path, Dir)> = Vec::new();
+        for path in paths {
+            let record = self
+                .directories
+                .get(path)
+                .ok_or_else(|| changed_directory(path))?;
+            let parent_path = path.parent().unwrap_or(Path::new(""));
+            while stack
+                .last()
+                .is_some_and(|(top_path, _)| *top_path != parent_path)
+            {
+                stack.pop();
+            }
+            let opened = if let Some((_, parent_dir)) = stack.last() {
+                let leaf = path.file_name().ok_or_else(|| changed_directory(path))?;
+                let next = parent_dir
+                    .open_dir_nofollow(Path::new(leaf))
+                    .map_err(|error| path_error(error, path))?;
+                if Identity::from_dir(&next)? != record.identity {
+                    return Err(changed_directory(path));
+                }
+                next
+            } else if parent_path.as_os_str().is_empty() {
+                let leaf = path.file_name().ok_or_else(|| changed_directory(path))?;
+                let next = self
+                    .root
+                    .open_dir_nofollow(Path::new(leaf))
+                    .map_err(|error| path_error(error, path))?;
+                if Identity::from_dir(&next)? != record.identity {
+                    return Err(changed_directory(path));
+                }
+                next
+            } else {
+                self.open_recorded_directory(path)?
+                    .ok_or_else(|| changed_directory(path))?
+            };
+            stack.push((path, opened));
         }
         Ok(())
     }
@@ -208,15 +481,12 @@ impl OutputTree {
             .as_ref()
             .map_or(&self.root, |parent| &parent.directory);
         let leaf = path.file_name().ok_or_else(|| changed_directory(path))?;
-        let metadata = directory.symlink_metadata(leaf)?;
-        if !metadata.is_file() {
-            return Err(changed_file(path));
-        }
-        Ok(Identity::from_cap(&metadata))
+        Identity::from_regular_entry(directory, Path::new(leaf))?.ok_or_else(|| changed_file(path))
     }
 
     pub(crate) fn cleanup<E: ExtractionRecord>(&mut self, files: &[E], identities: &[Identity]) {
         self.parent = None;
+        self.recent_parents.clear();
         if files.len() != identities.len() {
             return;
         }
@@ -227,9 +497,10 @@ impl OutputTree {
             };
             if let Ok(directory) = self.open_recorded_directory(parent) {
                 let base = directory.as_ref().unwrap_or(&self.root);
-                if base
-                    .symlink_metadata(leaf)
-                    .is_ok_and(|metadata| *identity == Identity::from_cap(&metadata))
+                if Identity::from_regular_entry(base, Path::new(leaf))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|live| live == *identity)
                 {
                     let _ = base.remove_file(leaf);
                 }
@@ -248,13 +519,16 @@ impl OutputTree {
             };
             if let Ok(directory) = self.open_recorded_directory(parent) {
                 let base = directory.as_ref().unwrap_or(&self.root);
-                if let Ok(metadata) = base.symlink_metadata(leaf)
-                    && metadata.is_dir()
-                    && self
-                        .directories
-                        .get(path)
-                        .is_some_and(|record| record.identity == Identity::from_cap(&metadata))
-                {
+                let matches_recorded = base
+                    .open_dir_nofollow(Path::new(leaf))
+                    .ok()
+                    .and_then(|dir| Identity::from_dir(&dir).ok())
+                    .is_some_and(|live| {
+                        self.directories
+                            .get(path)
+                            .is_some_and(|record| record.identity == live)
+                    });
+                if matches_recorded {
                     let _ = base.remove_dir(leaf);
                 }
             }
@@ -270,13 +544,13 @@ pub(crate) struct NewFile {
 }
 
 impl NewFile {
-    /// Create or truncate the file without following a symlink at its name.
+    /// Create a brand-new regular file without following a symlink or
+    /// overwriting an already-existing aliased entry (e.g. 8.3 short names).
     pub(crate) fn create(self) -> Result<PendingFile, LpmError> {
         let mut options = OpenOptions::new();
         options
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .follow(FollowSymlinks::No);
         self.open(&options)
     }
@@ -303,7 +577,18 @@ impl NewFile {
         let file = self
             .directory
             .open_with(&self.name, options)
-            .map_err(|error| path_error(error, &self.path))?
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    && let Ok(meta) = self.directory.symlink_metadata(&self.name)
+                    && meta.file_type().is_symlink()
+                {
+                    return path_error(
+                        io::Error::new(io::ErrorKind::InvalidInput, error),
+                        &self.path,
+                    );
+                }
+                path_error(error, &self.path)
+            })?
             .into_std();
         Ok(PendingFile {
             file,
@@ -323,14 +608,11 @@ pub(crate) struct PendingFile {
 
 impl PendingFile {
     pub(crate) fn identity(&self) -> Result<Identity, LpmError> {
-        Ok(Identity::from_cap(&cap_std::fs::Metadata::from_file(
-            &self.file,
-        )?))
+        Ok(Identity::from_std_file(&self.file)?)
     }
     pub(crate) fn validate(&self) -> Result<(), LpmError> {
-        let written = cap_std::fs::Metadata::from_file(&self.file)?;
-        let current = self.directory.symlink_metadata(&self.name)?;
-        if !current.is_file() || Identity::from_cap(&written) != Identity::from_cap(&current) {
+        let written = Identity::from_std_file(&self.file)?;
+        if Identity::from_regular_entry(&self.directory, &self.name)? != Some(written) {
             return Err(LpmError::Registry(
                 "tarball output file changed before inspection".into(),
             ));
@@ -340,11 +622,60 @@ impl PendingFile {
 
     pub(crate) fn complete(self) -> Result<CompletedFile, LpmError> {
         let identity = self.identity()?;
-        Ok(CompletedFile {
-            pending: self,
-            identity,
-        })
+        #[cfg(windows)]
+        {
+            let mut pending = self;
+            // Open a non-write pin handle before closing the write handle so the
+            // file identity stays pinned until commit while NTFS flushes timestamps
+            // on write-handle cleanup.
+            let pin = open_read_pin_nofollow(&pending.directory, &pending.name, identity)?;
+            let directory = Arc::clone(&pending.directory);
+            let name = std::mem::take(&mut pending.name);
+            pending.committed = true;
+            drop(pending);
+            Ok(CompletedFile {
+                directory,
+                name,
+                pin: Some(pin),
+                identity,
+                committed: false,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(CompletedFile {
+                pending: self,
+                identity,
+            })
+        }
     }
+
+    #[cfg_attr(unix, allow(dead_code))]
+    pub(crate) fn commit_with_stamp(
+        mut self,
+    ) -> Result<(Identity, Option<ExtractedFileStamp>), LpmError> {
+        let identity = self.identity()?;
+        #[cfg(windows)]
+        let stamp = {
+            // Only capture a post-close stamp when the path still resolves to
+            // the written file identity; otherwise commit the original identity
+            // with `None` (matching Unix) so callers rehash and rollback never
+            // deletes a replacement leaf.
+            let pin = open_read_pin_nofollow(&self.directory, &self.name, identity).ok();
+            self.committed = true;
+            drop(self);
+            pin.as_ref().and_then(stamp_from_closed_writer_pin)
+        };
+        #[cfg(not(windows))]
+        let stamp = {
+            self.committed = true;
+            drop(self);
+            None
+        };
+        Ok((identity, stamp))
+    }
+
+    #[cfg(any(test, not(windows)))]
     pub(crate) fn commit(mut self) {
         self.committed = true;
     }
@@ -353,16 +684,27 @@ impl PendingFile {
 impl Drop for PendingFile {
     fn drop(&mut self) {
         if !self.committed
-            && let Ok(written) = cap_std::fs::Metadata::from_file(&self.file)
-            && let Ok(current) = self.directory.symlink_metadata(&self.name)
-            && current.is_file()
-            && Identity::from_cap(&written) == Identity::from_cap(&current)
+            && let Ok(written) = Identity::from_std_file(&self.file)
+            && Identity::from_regular_entry(&self.directory, &self.name)
+                .ok()
+                .flatten()
+                .is_some_and(|current| current == written)
         {
             let _ = self.directory.remove_file(&self.name);
         }
     }
 }
 
+#[cfg(windows)]
+pub(crate) struct CompletedFile {
+    directory: Arc<Dir>,
+    name: PathBuf,
+    pin: Option<File>,
+    identity: Identity,
+    committed: bool,
+}
+
+#[cfg(not(windows))]
 pub(crate) struct CompletedFile {
     // Pin the original file identity until ordered acceptance or rollback.
     pending: PendingFile,
@@ -370,18 +712,68 @@ pub(crate) struct CompletedFile {
 }
 
 impl CompletedFile {
-    pub(crate) fn commit(self) -> Result<Identity, LpmError> {
-        let current = self
-            .pending
-            .directory
-            .symlink_metadata(&self.pending.name)?;
-        if !current.is_file() || self.identity != Identity::from_cap(&current) {
-            return Err(LpmError::Registry(
-                "tarball output file changed before acceptance".into(),
-            ));
+    pub(crate) fn verify_for_commit(&self) -> Result<Option<ExtractedFileStamp>, LpmError> {
+        #[cfg(windows)]
+        {
+            if Identity::from_regular_entry(&self.directory, &self.name)? != Some(self.identity) {
+                return Err(LpmError::Registry(
+                    "tarball output file changed before acceptance".into(),
+                ));
+            }
+            Ok(self.pin.as_ref().and_then(stamp_from_closed_writer_pin))
         }
-        self.pending.commit();
-        Ok(self.identity)
+        #[cfg(not(windows))]
+        {
+            let current = self
+                .pending
+                .directory
+                .symlink_metadata(&self.pending.name)?;
+            if !current.is_file() || self.identity != Identity::from_cap(&current) {
+                return Err(LpmError::Registry(
+                    "tarball output file changed before acceptance".into(),
+                ));
+            }
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn finish_commit(self) -> Identity {
+        #[cfg(windows)]
+        {
+            let mut this = self;
+            let identity = this.identity;
+            this.committed = true;
+            this.pin.take();
+            identity
+        }
+        #[cfg(not(windows))]
+        {
+            let identity = self.identity;
+            self.pending.commit();
+            identity
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit(self) -> Result<(Identity, Option<ExtractedFileStamp>), LpmError> {
+        let stamp = self.verify_for_commit()?;
+        Ok((self.finish_commit(), stamp))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CompletedFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.pin.take();
+            if Identity::from_regular_entry(&self.directory, &self.name)
+                .ok()
+                .flatten()
+                .is_some_and(|current| current == self.identity)
+            {
+                let _ = self.directory.remove_file(&self.name);
+            }
+        }
     }
 }
 
@@ -437,12 +829,12 @@ mod tests {
         pending.commit();
         let identity = output.accepted_file_identity(path).unwrap();
         assert!(identity == written_identity);
-        output
-            .prepare_parent(
-                Path::new("root-file"),
-                &mut PathLedgerBudget::new(usize::MAX),
-            )
-            .unwrap();
+        let mut budget = PathLedgerBudget::new(usize::MAX);
+        for index in 0..=MAX_CACHED_PARENTS {
+            output
+                .prepare_parent(&PathBuf::from(format!("evict-{index}/file")), &mut budget)
+                .unwrap();
+        }
         std::fs::rename(root.join("lib"), root.join("moved")).unwrap();
         std::fs::create_dir(root.join("lib")).unwrap();
         std::fs::write(root.join(path), b"keep").unwrap();
@@ -477,6 +869,21 @@ mod tests {
         assert_eq!(error.raw_os_error(), Some(32));
         output
             .prepare_parent(Path::new("root-file"), &mut budget)
+            .unwrap();
+        let parked_error = std::fs::rename(root.join("lib"), root.join("moved")).unwrap_err();
+        assert_eq!(parked_error.raw_os_error(), Some(32));
+        for index in 0..MAX_CACHED_PARENTS {
+            output
+                .prepare_parent(&PathBuf::from(format!("evict-{index}/file")), &mut budget)
+                .unwrap();
+        }
+        let tail_error = std::fs::rename(root.join("lib"), root.join("moved")).unwrap_err();
+        assert_eq!(tail_error.raw_os_error(), Some(32));
+        output
+            .prepare_parent(
+                &PathBuf::from(format!("evict-{MAX_CACHED_PARENTS}/file")),
+                &mut budget,
+            )
             .unwrap();
         std::fs::rename(root.join("lib"), root.join("moved")).unwrap();
         assert!(output.validate().is_err());

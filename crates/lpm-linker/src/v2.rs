@@ -146,6 +146,7 @@ pub struct LinkPlanV2 {
     /// authoritative).
     pub linker_mode: LinkerMode,
     compatibility_bin_names: Vec<String>,
+    reused_link_keys: std::sync::Mutex<HashSet<String>>,
 }
 
 impl LinkPlanV2 {
@@ -514,6 +515,7 @@ fn link_v2_prepare_inner(
         meta_platform,
         linker_mode,
         compatibility_bin_names: normalize_compatibility_bin_names(compatibility_bin_names),
+        reused_link_keys: std::sync::Mutex::new(HashSet::new()),
     })
 }
 
@@ -562,6 +564,12 @@ pub fn link_v2_one_with_timings(
     )
     .entered();
     let entry = populate_one(target, store, &plan.key_map, &plan.meta_platform)?;
+    if !entry.freshly_populated {
+        plan.reused_link_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(entry.key.dir_name().to_string());
+    }
     let mat = MaterializedPackage {
         instance_id: Some(target.instance_id),
         name: target.target.name.clone(),
@@ -628,6 +636,7 @@ pub fn refresh_links_after_package_mutation(
         &plan.key_map,
         &plan.compatibility_bin_names,
         true,
+        None,
     )?;
     create_root_symlinks(
         project_dir,
@@ -669,6 +678,11 @@ fn link_v2_finalize_inner(
     let stage_timer = std::time::Instant::now();
     let compatibility_links = {
         let _s = tracing::info_span!("linker.finalize.compatibility").entered();
+        let reused_guard = plan
+            .reused_link_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let warm_keys = (!refresh_compatibility_copies).then_some(&*reused_guard);
         create_project_compatibility_links(
             project_dir,
             augmented_slice,
@@ -676,6 +690,7 @@ fn link_v2_finalize_inner(
             &plan.key_map,
             &plan.compatibility_bin_names,
             refresh_compatibility_copies,
+            warm_keys,
         )?
     };
     let compatibility_ms = stage_timer.elapsed().as_millis();

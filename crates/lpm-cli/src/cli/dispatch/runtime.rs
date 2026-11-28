@@ -73,10 +73,11 @@ pub(super) fn run_async_main() -> Result<()> {
     #[cfg(not(debug_assertions))]
     const ASYNC_STACK_BYTES: usize = 32 * 1024 * 1024;
 
+    let cpus = lpm_common::resources::effective_cpu_count();
     let workers = runtime_worker_threads(
         cli.command.as_ref(),
         std::env::var_os("TOKIO_WORKER_THREADS").is_some(),
-        std::thread::available_parallelism().map_or(1, |count| count.get()),
+        cpus,
         project_dir.as_deref(),
     );
     std::thread::Builder::new()
@@ -89,11 +90,10 @@ pub(super) fn run_async_main() -> Result<()> {
             if let Some(workers) = workers {
                 runtime_builder.worker_threads(workers);
             }
-            if let Some(cap) = std::env::var("LPM_MAX_BLOCKING_THREADS")
-                .ok()
-                .and_then(|s| s.parse::<std::num::NonZeroUsize>().ok())
-            {
-                runtime_builder.max_blocking_threads(cap.get());
+            if let Some(max_blocking_threads) = resolve_max_blocking_threads(
+                std::env::var("LPM_MAX_BLOCKING_THREADS").ok().as_deref(),
+            ) {
+                runtime_builder.max_blocking_threads(max_blocking_threads);
             }
             let result = runtime_builder
                 .build()
@@ -105,6 +105,12 @@ pub(super) fn run_async_main() -> Result<()> {
         .expect("failed to spawn async main thread")
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+fn resolve_max_blocking_threads(env_override: Option<&str>) -> Option<usize> {
+    env_override
+        .and_then(|s| s.parse::<std::num::NonZeroUsize>().ok())
+        .map(std::num::NonZeroUsize::get)
 }
 
 /// Keeps the project's `.lpm` and the LPM home out of git after any
@@ -551,6 +557,17 @@ mod tests {
         std::fs::write(project.path().join("Package.swift"), "").unwrap();
         assert_eq!(
             runtime_worker_threads(cli.command.as_ref(), false, 18, Some(project.path())),
+            None
+        );
+    }
+
+    #[test]
+    fn blocking_thread_pool_leaves_tokio_default_unless_env_overridden() {
+        assert_eq!(super::resolve_max_blocking_threads(None), None);
+        assert_eq!(super::resolve_max_blocking_threads(Some("24")), Some(24));
+        assert_eq!(super::resolve_max_blocking_threads(Some("0")), None);
+        assert_eq!(
+            super::resolve_max_blocking_threads(Some("not-a-number")),
             None
         );
     }

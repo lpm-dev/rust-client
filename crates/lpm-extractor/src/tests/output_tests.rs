@@ -441,9 +441,19 @@ fn digest_only_routes_match_inspected_digests_and_contents() {
         extract_tarball_from_reader_hybrid_digests(std::io::Cursor::new(&tgz), hybrid_dir.path())
             .unwrap();
 
-    assert_eq!(direct, inspected);
-    assert_eq!(streaming, inspected);
-    assert_eq!(hybrid, inspected);
+    fn summary(files: &[ExtractedFileDigest]) -> Vec<(&Path, u64, [u8; 32])> {
+        files
+            .iter()
+            .map(|f| (f.relative_path.as_path(), f.size, f.blake3_digest))
+            .collect()
+    }
+    assert_eq!(summary(&direct), summary(&inspected));
+    assert_eq!(summary(&streaming), summary(&inspected));
+    assert_eq!(summary(&hybrid), summary(&inspected));
+    #[cfg(any(unix, windows))]
+    for batch in [&inspected, &direct, &streaming, &hybrid] {
+        assert!(batch.iter().all(|f| f.source_stamp.is_some()));
+    }
     for file in inspected {
         let expected = std::fs::read(inspected_dir.path().join(&file.relative_path)).unwrap();
         assert_eq!(

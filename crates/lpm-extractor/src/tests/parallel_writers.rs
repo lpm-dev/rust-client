@@ -53,6 +53,13 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
+fn digest_summary(files: &[ExtractedFileDigest]) -> Vec<(&Path, u64, [u8; 32])> {
+    files
+        .iter()
+        .map(|f| (f.relative_path.as_path(), f.size, f.blake3_digest))
+        .collect()
+}
+
 fn extract_with_pool(
     archive: &[u8],
     target: &Path,
@@ -230,7 +237,9 @@ fn parallel_files_preserve_archive_order_and_final_duplicate_digests() {
     for count in [1, 2, 4, 8] {
         let target = tempfile::tempdir().unwrap();
         let actual = extract(&archive, target.path(), count).unwrap();
-        assert_eq!(actual, expected);
+        assert_eq!(digest_summary(&actual), digest_summary(&expected));
+        #[cfg(any(unix, windows))]
+        assert!(actual.iter().all(|f| f.source_stamp.is_some()));
         for file in actual {
             assert_eq!(
                 *blake3::hash(&std::fs::read(target.path().join(file.relative_path)).unwrap())
@@ -269,7 +278,8 @@ fn large_entries_stream_between_bounded_small_file_batches() {
     let expected = extract(&archive, reference.path(), 0).unwrap();
     for count in [1, 2, 4, 8] {
         let target = tempfile::tempdir().unwrap();
-        assert_eq!(extract(&archive, target.path(), count).unwrap(), expected);
+        let actual = extract(&archive, target.path(), count).unwrap();
+        assert_eq!(digest_summary(&actual), digest_summary(&expected));
         assert_eq!(std::fs::read(target.path().join("large")).unwrap(), large);
     }
 }
@@ -605,7 +615,9 @@ fn many_file_archives_start_writers_after_the_serial_prefix() {
             },
         )
         .unwrap();
-        assert_eq!(actual, expected);
+        assert_eq!(digest_summary(&actual), digest_summary(&expected));
+        #[cfg(any(unix, windows))]
+        assert!(actual.iter().all(|f| f.source_stamp.is_some()));
         let expected_writes = if matches!(inspection, InspectionMode::WithoutCallback) {
             14
         } else {

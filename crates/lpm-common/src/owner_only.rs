@@ -34,17 +34,25 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 /// The DACL of an owner-only file: full control for the owner, the user
 /// LPM runs as and SYSTEM.
 pub fn owner_only_file_dacl() -> std::io::Result<String> {
+    static DACL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(dacl) = DACL.get() {
+        return Ok(dacl.clone());
+    }
     let user = process_user_sid()?;
-    Ok(format!("D:P(A;;FA;;;OW)(A;;FA;;;{user})(A;;FA;;;SY)"))
+    let dacl = format!("D:P(A;;FA;;;OW)(A;;FA;;;{user})(A;;FA;;;SY)");
+    Ok(DACL.get_or_init(|| dacl).clone())
 }
 
 /// The DACL of an owner-only directory: full control for the owner, the
 /// user LPM runs as and SYSTEM, which what is created in it inherits.
 pub fn owner_only_directory_dacl() -> std::io::Result<String> {
+    static DACL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(dacl) = DACL.get() {
+        return Ok(dacl.clone());
+    }
     let user = process_user_sid()?;
-    Ok(format!(
-        "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)"
-    ))
+    let dacl = format!("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)");
+    Ok(DACL.get_or_init(|| dacl).clone())
 }
 
 /// The DACL of LPM's state directories, a project's `.lpm` and the LPM
@@ -53,7 +61,12 @@ pub fn owner_only_directory_dacl() -> std::io::Result<String> {
 /// which a sandboxed lifecycle script needs to reach the access it was
 /// granted below.
 fn state_directory_dacl() -> std::io::Result<String> {
-    Ok(format!("{}(A;;0xa0;;;AC)", owner_only_directory_dacl()?))
+    static DACL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(dacl) = DACL.get() {
+        return Ok(dacl.clone());
+    }
+    let dacl = format!("{}(A;;0xa0;;;AC)", owner_only_directory_dacl()?);
+    Ok(DACL.get_or_init(|| dacl).clone())
 }
 
 /// The SID of the user LPM runs as, as SDDL writes it. It is the same
@@ -63,8 +76,47 @@ pub fn process_user_sid() -> std::io::Result<String> {
     if let Some(sid) = SID.get() {
         return Ok(sid.clone());
     }
-    let sid = ProcessUser::query()?.sid_string()?;
+    let sid = ProcessUser::cached()?.sid_string()?;
     Ok(SID.get_or_init(|| sid).clone())
+}
+
+struct CachedSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+// SAFETY: A parsed Win32 security descriptor returned by
+// `ConvertStringSecurityDescriptorToSecurityDescriptorW` is immutable once
+// initialized and safe to read concurrently across threads for the process lifetime.
+unsafe impl Send for CachedSecurityDescriptor {}
+// SAFETY: See above.
+unsafe impl Sync for CachedSecurityDescriptor {}
+
+fn cached_owner_only_file_descriptor() -> std::io::Result<PSECURITY_DESCRIPTOR> {
+    static DESCRIPTOR: std::sync::OnceLock<CachedSecurityDescriptor> = std::sync::OnceLock::new();
+    if let Some(cached) = DESCRIPTOR.get() {
+        return Ok(cached.0);
+    }
+    let parsed = security_descriptor(&owner_only_file_dacl()?)?;
+    let raw = parsed.0;
+    if DESCRIPTOR.set(CachedSecurityDescriptor(raw)).is_ok() {
+        std::mem::forget(parsed);
+        Ok(raw)
+    } else {
+        Ok(DESCRIPTOR.get().expect("initialized").0)
+    }
+}
+
+fn cached_state_directory_descriptor() -> std::io::Result<PSECURITY_DESCRIPTOR> {
+    static DESCRIPTOR: std::sync::OnceLock<CachedSecurityDescriptor> = std::sync::OnceLock::new();
+    if let Some(cached) = DESCRIPTOR.get() {
+        return Ok(cached.0);
+    }
+    let parsed = security_descriptor(&state_directory_dacl()?)?;
+    let raw = parsed.0;
+    if DESCRIPTOR.set(CachedSecurityDescriptor(raw)).is_ok() {
+        std::mem::forget(parsed);
+        Ok(raw)
+    } else {
+        Ok(DESCRIPTOR.get().expect("initialized").0)
+    }
 }
 
 /// What [`state_directory_dacl`] lets application packages do: read the
@@ -97,7 +149,11 @@ pub fn protect_file(file: &impl std::os::windows::io::AsRawHandle) -> std::io::R
     if keeps_no_permissions(file) {
         return Ok(());
     }
-    set_protected_dacl(file, &owner_only_file_dacl()?)
+    set_security_object_raw(
+        file,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        cached_owner_only_file_descriptor()?,
+    )
 }
 
 /// Whether `file` is kept from everyone but its owner, the user running
@@ -136,7 +192,7 @@ pub fn keeps_others_out(file: &impl std::os::windows::io::AsRawHandle) -> std::i
     if control & SE_DACL_PROTECTED == 0 || dacl.is_null() {
         return Ok(false);
     }
-    let user = ProcessUser::query()?;
+    let user = ProcessUser::cached()?;
     // SAFETY: GetSecurityInfo returned a DACL inside the live descriptor.
     let entries = unsafe { (*dacl).AceCount };
     for index in 0..u32::from(entries) {
@@ -214,14 +270,17 @@ pub fn protect_state_directory(
     if keeps_no_permissions(&handle) {
         return Ok(false);
     }
-    let dacl = state_directory_dacl()?;
     match state_directory_access(&handle)? {
         StateDirectoryAccess::Kept => return Ok(false),
         StateDirectoryAccess::KeptForTheOwner | StateDirectoryAccess::Open if push_to_contents => {
-            set_protected_tree_dacl(&final_path(&handle)?, &dacl)?;
+            set_protected_tree_dacl(&final_path(&handle)?, &state_directory_dacl()?)?;
         }
         StateDirectoryAccess::KeptForTheOwner | StateDirectoryAccess::Open => {
-            set_protected_dacl(&handle, &dacl)?;
+            set_security_object_raw(
+                &handle,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                cached_state_directory_descriptor()?,
+            )?;
         }
     }
     Ok(true)
@@ -306,7 +365,7 @@ fn state_directory_access(
     if control & SE_DACL_PROTECTED == 0 || dacl.is_null() {
         return Ok(StateDirectoryAccess::Open);
     }
-    let user = ProcessUser::query()?;
+    let user = ProcessUser::cached()?;
     let (mut packages_pass, mut user_kept) = (false, false);
     // SAFETY: GetSecurityInfo returned a DACL inside the live descriptor.
     let entries = unsafe { (*dacl).AceCount };
@@ -414,6 +473,15 @@ fn set_protected_tree_dacl(path: &std::path::Path, sddl: &str) -> std::io::Resul
 struct ProcessUser(Vec<u64>);
 
 impl ProcessUser {
+    fn cached() -> std::io::Result<&'static Self> {
+        static USER: std::sync::OnceLock<ProcessUser> = std::sync::OnceLock::new();
+        if let Some(user) = USER.get() {
+            return Ok(user);
+        }
+        let queried = Self::query()?;
+        Ok(USER.get_or_init(|| queried))
+    }
+
     fn query() -> std::io::Result<Self> {
         let mut token: HANDLE = null_mut();
         // SAFETY: the pseudo-handle is valid; `token` receives a handle closed below.
@@ -595,9 +663,17 @@ fn set_security_object(
     information: u32,
     descriptor: &LocalSecurityDescriptor,
 ) -> std::io::Result<()> {
+    set_security_object_raw(file, information, descriptor.0)
+}
+
+fn set_security_object_raw(
+    file: &impl std::os::windows::io::AsRawHandle,
+    information: u32,
+    descriptor: PSECURITY_DESCRIPTOR,
+) -> std::io::Result<()> {
     // SAFETY: the handle is valid for the call and the descriptor outlives it.
     let status =
-        unsafe { NtSetSecurityObject(file.as_raw_handle().cast(), information, descriptor.0) };
+        unsafe { NtSetSecurityObject(file.as_raw_handle().cast(), information, descriptor) };
     if status == 0 {
         Ok(())
     } else {
@@ -607,8 +683,7 @@ fn set_security_object(
     }
 }
 
-/// Sets `file`'s DACL to `sddl`'s, inheriting nothing. The handle needs
-/// `WRITE_DAC`.
+#[cfg(test)]
 fn set_protected_dacl(
     file: &impl std::os::windows::io::AsRawHandle,
     sddl: &str,

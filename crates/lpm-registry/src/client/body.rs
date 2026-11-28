@@ -34,8 +34,10 @@ fn chunked_overflow_limiter() -> &'static Arc<tokio::sync::Semaphore> {
 fn large_metadata_parse_limiter() -> &'static Arc<tokio::sync::Semaphore> {
     static LIMITER: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     LIMITER.get_or_init(|| {
-        let permits =
-            std::thread::available_parallelism().map_or(2, |cpus| (cpus.get() / 4).clamp(2, 4));
+        let permits = lpm_common::resources::large_metadata_parse_permits(
+            lpm_common::resources::effective_cpu_count(),
+            lpm_common::resources::effective_memory_limit_bytes(),
+        );
         Arc::new(tokio::sync::Semaphore::new(permits))
     })
 }

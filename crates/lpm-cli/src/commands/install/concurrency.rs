@@ -8,8 +8,8 @@ pub(super) const V2_CACHE_CHECK_MAX_CONCURRENCY: usize = 16;
 pub(super) const V2_LINK_TASK_MAX_CONCURRENCY: usize = 16;
 const ENV_V2_LINK_TASKS: &str = "LPM_V2_LINK_TASKS";
 
-fn v2_cache_check_concurrency(candidate_count: usize) -> usize {
-    let parallelism = std::thread::available_parallelism().map_or(4, |threads| threads.get());
+pub(super) fn v2_cache_check_concurrency(candidate_count: usize) -> usize {
+    let parallelism = lpm_common::resources::effective_cpu_count();
     parallelism
         .clamp(1, V2_CACHE_CHECK_MAX_CONCURRENCY)
         .min(candidate_count.max(1))
@@ -31,7 +31,7 @@ fn v2_link_task_concurrency_with_limit(target_count: usize, limit: usize) -> usi
     {
         return configured.min(target_count.max(1));
     }
-    let parallelism = std::thread::available_parallelism().map_or(4, |threads| threads.get());
+    let parallelism = lpm_common::resources::effective_cpu_count();
     parallelism.clamp(1, limit).min(target_count.max(1))
 }
 
@@ -303,12 +303,13 @@ pub(super) async fn prevalidate_v2_reusable_objects(
         let store_v2 = Arc::clone(&store_v2);
         let validation_batch = validation_batch.clone();
         let (batch_results, overflow) = tokio::task::spawn_blocking(move || {
+            let inline_started = std::time::Instant::now();
             let mut batch_results = Vec::with_capacity(unique_candidates.len());
             let mut iter = unique_candidates.into_iter();
             while let Some(sri) = iter.next() {
                 let (hit, timings) =
                     store_v2.reusable_object_with_timings_in_batch(&sri, &validation_batch)?;
-                let slow = timings.total_ms >= INLINE_SLOW_CHECK_THRESHOLD_MS;
+                let slow = inline_started.elapsed().as_millis() >= INLINE_SLOW_CHECK_THRESHOLD_MS;
                 batch_results.push((sri, hit, timings));
                 if slow {
                     let overflow: Vec<String> = iter.collect();

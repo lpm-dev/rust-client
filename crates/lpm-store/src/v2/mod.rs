@@ -58,6 +58,7 @@ pub use fs_util::is_staging_dir_name;
 #[cfg(target_os = "linux")]
 pub use fs_util::linux_copy::{
     copy_file as linux_copy_file, copy_file_plain_io as linux_copy_file_io,
+    copy_file_warm_plain_io as linux_copy_file_warm_io,
 };
 pub use graph_key::{DepEdge, GraphKey, GraphKeyInputs, LinkerModeTag, PeerEntry};
 pub use link_meta::{

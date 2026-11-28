@@ -54,12 +54,26 @@ impl Read for DecodedReader {
                     tracing::trace_span!(target: "lpm_install_timeline", "decoded_buffer_wait")
                         .entered();
                 if self.writer_failed.is_active() {
-                    loop {
-                        match self.ready.recv_timeout(Duration::from_millis(5)) {
-                            Err(RecvTimeoutError::Timeout) if !self.writer_failed.has_failed() => {
-                                continue;
+                    match self.ready.try_recv() {
+                        Ok(msg) => Ok(msg),
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            Err(RecvTimeoutError::Disconnected)
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            // Flush any queued sub-threshold writer batch before
+                            // blocking on network/decoder input so a local open
+                            // error cancels a stalled stream promptly.
+                            self.writer_failed.flush_pending_batch();
+                            loop {
+                                match self.ready.recv_timeout(Duration::from_millis(5)) {
+                                    Err(RecvTimeoutError::Timeout)
+                                        if !self.writer_failed.has_failed() =>
+                                    {
+                                        continue;
+                                    }
+                                    result => break result,
+                                }
                             }
-                            result => break result,
                         }
                     }
                 } else {
@@ -236,6 +250,44 @@ pub(super) fn extract(
         StreamFormat::Gzip,
         true,
         cancel_input,
+    )
+}
+
+pub(super) fn extract_with_inspector<P, I>(
+    reader: impl Read + Send,
+    target_dir: &Path,
+    limits: ExtractionLimits,
+    buffer_predicate: P,
+    inspector: I,
+    cancel_input: impl FnOnce(),
+) -> Result<Vec<ExtractedFileDigest>, LpmError>
+where
+    P: Fn(&Path, u64) -> bool,
+    I: for<'a> FnMut(super::EntryInfo<'a>),
+{
+    with_decoder(
+        reader,
+        StreamFormat::Gzip,
+        limits,
+        cancel_input,
+        |decoded| {
+            extract_tar_archive_until(
+                decoded,
+                target_dir,
+                limits,
+                true,
+                buffer_predicate,
+                inspector,
+                InspectionMode::WithCallback,
+                |mut reader| {
+                    io::copy(&mut reader, &mut io::sink())
+                        .map(|_| ())
+                        .map_err(LpmError::Io)
+                },
+                crate::writers::WriterSetup::Disabled,
+                ArchiveEnd::FirstZeroBlock,
+            )
+        },
     )
 }
 
@@ -1025,5 +1077,176 @@ mod tests {
             .is_err()
         );
         assert!(cancelled.get());
+    }
+
+    #[test]
+    fn pipelined_inspector_invokes_callback_in_order_and_computes_digests() {
+        let archive = create_test_tarball_with_entries(&[
+            ("a.js", b"console.log('a');"),
+            ("nested/b.txt", b"not-buffered"),
+            ("nested/c.js", b"console.log('c');"),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let mut seen = Vec::new();
+        let files = crate::extract_tarball_from_reader_pipelined_with_entry_digests(
+            archive.as_slice(),
+            root.path(),
+            |path, _| path.extension().and_then(|ext| ext.to_str()) == Some("js"),
+            |entry| {
+                seen.push((
+                    entry.relative_path.to_path_buf(),
+                    entry.bytes.map(<[u8]>::to_vec),
+                    entry.blake3_digest,
+                ));
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].0, Path::new("a.js"));
+        assert_eq!(seen[0].1.as_deref(), Some(b"console.log('a');".as_slice()));
+        assert_eq!(seen[1].0, Path::new("nested/b.txt"));
+        assert!(seen[1].1.is_none());
+        assert_eq!(seen[2].0, Path::new("nested/c.js"));
+        assert_eq!(seen[2].1.as_deref(), Some(b"console.log('c');".as_slice()));
+        for (file, (_, _, digest)) in files.iter().zip(&seen) {
+            assert_eq!(Some(file.blake3_digest), *digest);
+        }
+    }
+
+    #[test]
+    fn stalled_stream_flushes_sub_threshold_writer_batch_so_local_error_cancels_input() {
+        // Build a tar stream whose prefix exceeds BUFFER_SIZE so the decoder
+        // flushes entries 1-2 to DecodedReader immediately and then stalls
+        // waiting for the trailing bytes of entry 3.
+        let large_padding = vec![b'x'; BUFFER_SIZE];
+        let mut prefix = tar_stream(&[
+            (b"package/hold.js", b"1"),
+            (b"package/fail.js", b"2"),
+            (b"package/stall.js", &large_padding),
+        ]);
+        // Keep enough bytes to cross one full BUFFER_SIZE chunk (delivering
+        // hold.js and fail.js) while stopping mid-entry on stall.js so the stream stalls.
+        prefix.truncate(BUFFER_SIZE + 512);
+
+        let root = tempfile::tempdir().unwrap();
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        struct StallAfterPrefix {
+            bytes: Vec<u8>,
+            pos: usize,
+            cancel_rx: std::sync::mpsc::Receiver<()>,
+        }
+        impl Read for StallAfterPrefix {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos < self.bytes.len() {
+                    let n = (self.bytes.len() - self.pos).min(buf.len());
+                    buf[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
+                    self.pos += n;
+                    return Ok(n);
+                }
+                match self.cancel_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(()) => Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")),
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "stalled stream timed out",
+                    )),
+                }
+            }
+        }
+
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_clone = Arc::clone(&cancelled);
+        let saw_stall_flush = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_stall_flush_clone = Arc::clone(&saw_stall_flush);
+        let in_flight_slot: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>> =
+            Arc::new(Mutex::new(None));
+        let in_flight_for_hook = Arc::clone(&in_flight_slot);
+        let reader = StallAfterPrefix {
+            bytes: prefix,
+            pos: 0,
+            cancel_rx,
+        };
+        let started = std::time::Instant::now();
+        let result = with_decoder(
+            reader,
+            StreamFormat::Tar,
+            DEFAULT_EXTRACTION_LIMITS,
+            move || {
+                cancelled_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = cancel_tx.try_send(());
+            },
+            |decoded| {
+                let failure = decoded
+                    .writer_failure_signal()
+                    .expect("parallel decoder must expose a failure signal");
+                let hooks = crate::writers::TestHooks {
+                    before_open: Some(Arc::new(move |job| {
+                        if job.sequence == 0 {
+                            // Hold the sole worker busy so job 1 sits in pending_batch
+                            // until DecodedReader's stall flush dispatches a second batch.
+                            let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+                            while std::time::Instant::now() < deadline {
+                                let count = in_flight_for_hook
+                                    .lock()
+                                    .unwrap()
+                                    .as_ref()
+                                    .map_or(0, |counter| {
+                                        counter.load(std::sync::atomic::Ordering::Acquire)
+                                    });
+                                if count >= 2 {
+                                    saw_stall_flush_clone
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                                    return Ok(());
+                                }
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                            return Ok(());
+                        }
+                        Err(LpmError::Io(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "injected open error",
+                        )))
+                    })),
+                    ..crate::writers::TestHooks::default()
+                };
+                let pool = crate::writers::WriterPool::new_with_hooks(1, hooks, Some(failure))?;
+                *in_flight_slot.lock().unwrap() = Some(pool.in_flight_batches());
+                extract_tar_archive_until::<_, _, _, _, std::path::PathBuf>(
+                    decoded,
+                    root.path(),
+                    DEFAULT_EXTRACTION_LIMITS,
+                    false,
+                    |_, _| false,
+                    |_| {},
+                    InspectionMode::WithoutCallback,
+                    |mut reader| {
+                        io::copy(&mut reader, &mut io::sink())
+                            .map(|_| ())
+                            .map_err(LpmError::Io)
+                    },
+                    crate::writers::WriterSetup::Ready(pool),
+                    ArchiveEnd::EndOfInput,
+                )
+            },
+        );
+        assert!(
+            result.is_err(),
+            "failing open in sub-threshold batch must fail extraction"
+        );
+        assert!(
+            saw_stall_flush.load(std::sync::atomic::Ordering::SeqCst),
+            "job 1 must remain buffered while worker is busy and dispatch only when DecodedReader flushes on stream stall"
+        );
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "failing open in sub-threshold batch must cancel stalled input instead of waiting for timeout (elapsed {:?})",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancellation must occur promptly rather than waiting for stream timeout: {:?}",
+            started.elapsed()
+        );
     }
 }

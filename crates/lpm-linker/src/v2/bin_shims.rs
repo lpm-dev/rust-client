@@ -148,13 +148,7 @@ pub(super) fn create_bin_links_v2(
             Err(_) => continue,
         };
 
-        // Fast byte pre-scan to skip serde_json parse entirely for
-        // direct deps that declare no `bin`. The quoted key `"bin"`
-        // reliably identifies the JSON field; any false positive (a
-        // value containing the 5-byte sequence) is harmless — we just
-        // parse and get back None.
-        const BIN_KEY: &[u8] = b"\"bin\"";
-        if !content.windows(BIN_KEY.len()).any(|w| w == BIN_KEY) {
+        if !lpm_workspace::manifest_bytes_may_contain_bin(&content) {
             continue;
         }
 
@@ -391,7 +385,7 @@ pub fn create_lifecycle_bin_links(
                 provider.name
             ))
         })?;
-        if !content.windows(5).any(|window| window == b"\"bin\"") {
+        if !lpm_workspace::manifest_bytes_may_contain_bin(&content) {
             continue;
         }
         let Some(config) = lpm_workspace::parse_bin_field(&content).map_err(|error| {

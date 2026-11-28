@@ -81,21 +81,11 @@ pub(super) enum V2StreamingEligibility<'a> {
 const ENV_FETCH_EXTRACT_PERMITS: &str = "LPM_FETCH_EXTRACT_PERMITS";
 const ENV_EXPERIMENTAL_RESOLVER: &str = "LPM_EXPERIMENTAL_INSTALLER_SPIKE";
 const ENV_V2_STREAMING_EXTRACT_WEIGHT: &str = "LPM_V2_STREAMING_EXTRACT_WEIGHT";
-// APFS store finalization contends on filesystem metadata above 4 writers.
-// Non-macOS kernels (Linux ext4/btrfs/xfs, Windows NTFS) scale cleanly with cores.
-pub(super) const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 4;
-
 pub(super) fn default_bounded_fetch_extract_permits() -> usize {
-    #[cfg(target_os = "macos")]
-    {
-        DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        std::thread::available_parallelism().map_or(DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS, |n| {
-            n.get().clamp(4, 8)
-        })
-    }
+    lpm_common::resources::default_fetch_extract_permits(
+        lpm_common::resources::effective_cpu_count(),
+        lpm_common::resources::effective_memory_limit_bytes(),
+    )
 }
 const DEFAULT_LARGE_V2_STREAMING_EXTRACT_WEIGHT: usize = 2;
 pub(super) const LARGE_V2_STREAMING_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
@@ -166,8 +156,11 @@ pub(super) const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 24;
 /// users notice their override silently didn't apply. Unset → default,
 /// silently.
 pub(super) fn max_concurrent_downloads() -> usize {
+    let default_downloads = lpm_common::resources::default_max_concurrent_downloads(
+        lpm_common::resources::effective_memory_limit_bytes(),
+    );
     let Some(raw) = std::env::var("LPM_CONCURRENT_DOWNLOADS").ok() else {
-        return DEFAULT_MAX_CONCURRENT_DOWNLOADS;
+        return default_downloads;
     };
     match raw.parse::<usize>() {
         Ok(n) if n > 0 && n <= 256 => n,
@@ -175,9 +168,9 @@ pub(super) fn max_concurrent_downloads() -> usize {
             let raw = lpm_common::sanitize_terminal_inline(&raw);
             crate::output::warn(&format!(
                 "LPM_CONCURRENT_DOWNLOADS={raw:?} is not a valid integer in 1..=256 \
-                 — falling back to default ({DEFAULT_MAX_CONCURRENT_DOWNLOADS})"
+                 — falling back to default ({default_downloads})"
             ));
-            DEFAULT_MAX_CONCURRENT_DOWNLOADS
+            default_downloads
         }
     }
 }
@@ -3095,10 +3088,15 @@ mod tests {
     fn fetch_extract_permits_default_to_platform_bound_for_v2_installs() {
         let permits = default_fetch_extract_permits(true).unwrap();
         assert_eq!(permits, default_bounded_fetch_extract_permits());
+        let expected = lpm_common::resources::default_fetch_extract_permits(
+            lpm_common::resources::effective_cpu_count(),
+            lpm_common::resources::effective_memory_limit_bytes(),
+        );
+        assert_eq!(permits, expected);
         #[cfg(target_os = "macos")]
-        assert_eq!(permits, 4);
+        assert!((1..=4).contains(&permits));
         #[cfg(not(target_os = "macos"))]
-        assert!((4..=12).contains(&permits));
+        assert!((1..=8).contains(&permits));
     }
 
     #[test]

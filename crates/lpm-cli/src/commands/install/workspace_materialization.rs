@@ -298,7 +298,9 @@ impl WorkspaceMaterializationCoordinator {
             ))),
             graph_key_cache: lpm_linker::v2::GraphKeyCache::default(),
             object_validation_permits: Arc::new(Semaphore::new(
-                super::concurrency::V2_CACHE_CHECK_MAX_CONCURRENCY,
+                super::concurrency::v2_cache_check_concurrency(
+                    super::concurrency::V2_CACHE_CHECK_MAX_CONCURRENCY,
+                ),
             )),
             object_validation_results: Arc::new(dashmap::DashMap::new()),
             object_validations_in_flight: Mutex::new(HashSet::new()),
@@ -510,12 +512,82 @@ impl WorkspaceMaterializationCoordinator {
             drop(in_flight);
 
             if !claimed.is_empty() {
-                let concurrency = self.object_validation_concurrency(claimed.len());
-                max_concurrency = max_concurrency.max(concurrency);
-                let permits = Arc::clone(&self.object_validation_permits);
-                let check_source_sris = claimed.clone();
-                let mut checks =
-                    futures::stream::iter(check_source_sris.into_iter().map(|source_sri| {
+                let mut completed = Vec::with_capacity(claimed.len());
+                // Mirror standalone prevalidation: warm V2 Source checks are a fast
+                // stat + sidecar read, so avoid fanning out up to 16 blocking threads
+                // unless a slow check spills onto the parallel lane.
+                let inline_source_check = store.object_integrity_policy()
+                    == lpm_store::v2::ObjectIntegrityPolicy::Source
+                    && store.supports_streamed_object_ingest()
+                    && claimed.len() <= 256;
+                let mut remaining = if inline_source_check {
+                    const INLINE_SLOW_CHECK_THRESHOLD_MS: u128 = 10;
+                    max_concurrency = max_concurrency.max(1);
+                    let permit = self.object_validation_permits.acquire().await.map_err(|_| {
+                        LpmError::Registry(
+                            "virtual-store object validation semaphore closed".into(),
+                        )
+                    });
+                    let inline_result = match permit {
+                        Ok(_permit) => {
+                            let check_source_sris = claimed.clone();
+                            let store = Arc::clone(&store);
+                            let validation_batch = validation_batch.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let inline_started = std::time::Instant::now();
+                                let mut batch_results = Vec::with_capacity(check_source_sris.len());
+                                let mut iter = check_source_sris.into_iter();
+                                while let Some(source_sri) = iter.next() {
+                                    let (reusable, timings) = store
+                                        .reusable_object_with_timings_in_batch(
+                                            &source_sri,
+                                            &validation_batch,
+                                        )?;
+                                    let slow = inline_started.elapsed().as_millis()
+                                        >= INLINE_SLOW_CHECK_THRESHOLD_MS;
+                                    batch_results
+                                        .push((source_sri, ObjectValidation { reusable, timings }));
+                                    if slow {
+                                        let overflow: Vec<String> = iter.collect();
+                                        return Ok::<_, LpmError>((batch_results, overflow));
+                                    }
+                                }
+                                Ok::<_, LpmError>((batch_results, Vec::new()))
+                            })
+                            .await
+                            .map_err(|error| {
+                                LpmError::Registry(format!(
+                                    "virtual-store cache check task panicked: {error}"
+                                ))
+                            })
+                            .and_then(|res| res)
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match inline_result {
+                        Ok((batch_results, overflow)) => {
+                            completed.extend(batch_results);
+                            overflow
+                        }
+                        Err(error) => {
+                            let mut in_flight = self.object_validations_in_flight.lock().await;
+                            for source_sri in &claimed {
+                                in_flight.remove(source_sri);
+                            }
+                            drop(in_flight);
+                            self.object_validations_ready.notify_waiters();
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    claimed.clone()
+                };
+
+                if !remaining.is_empty() {
+                    let concurrency = self.object_validation_concurrency(remaining.len());
+                    max_concurrency = max_concurrency.max(concurrency);
+                    let permits = Arc::clone(&self.object_validation_permits);
+                    let mut checks = futures::stream::iter(remaining.drain(..).map(|source_sri| {
                         let permits = Arc::clone(&permits);
                         let store = Arc::clone(&store);
                         let validation_batch = validation_batch.clone();
@@ -545,18 +617,18 @@ impl WorkspaceMaterializationCoordinator {
                     }))
                     .buffer_unordered(concurrency);
 
-                let mut completed = Vec::with_capacity(claimed.len());
-                while let Some(result) = checks.next().await {
-                    match result {
-                        Ok(result) => completed.push(result),
-                        Err(error) => {
-                            let mut in_flight = self.object_validations_in_flight.lock().await;
-                            for source_sri in &claimed {
-                                in_flight.remove(source_sri);
+                    while let Some(result) = checks.next().await {
+                        match result {
+                            Ok(result) => completed.push(result),
+                            Err(error) => {
+                                let mut in_flight = self.object_validations_in_flight.lock().await;
+                                for source_sri in &claimed {
+                                    in_flight.remove(source_sri);
+                                }
+                                drop(in_flight);
+                                self.object_validations_ready.notify_waiters();
+                                return Err(error);
                             }
-                            drop(in_flight);
-                            self.object_validations_ready.notify_waiters();
-                            return Err(error);
                         }
                     }
                 }
@@ -615,7 +687,7 @@ impl WorkspaceMaterializationCoordinator {
     }
 
     pub(super) fn object_validation_concurrency(&self, candidate_count: usize) -> usize {
-        super::concurrency::V2_CACHE_CHECK_MAX_CONCURRENCY.min(candidate_count.max(1))
+        super::concurrency::v2_cache_check_concurrency(candidate_count)
     }
 
     #[cfg(test)]
@@ -1383,5 +1455,40 @@ mod tests {
             first.value.materialized.destination,
             second.value.materialized.destination
         );
+    }
+
+    #[tokio::test]
+    async fn warm_v2_source_validation_runs_inline_and_clamps_concurrency_to_cpus() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("pkg");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("package.json"),
+            br#"{"name":"inline-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let store = Arc::new(lpm_store::v2::Store::at(temp.path().join("store")));
+        let sri_a = lpm_store::compute_sri_hash(b"inline-a");
+        let sri_b = lpm_store::compute_sri_hash(b"inline-b");
+        store
+            .populate_object_from_local_source(&source, &sri_a)
+            .unwrap();
+        store
+            .populate_object_from_local_source(&source, &sri_b)
+            .unwrap();
+
+        let coordinator = WorkspaceMaterializationCoordinator::new(Vec::new());
+        assert!(
+            coordinator.object_validation_concurrency(100)
+                <= lpm_common::resources::effective_cpu_count()
+                    .clamp(1, super::super::concurrency::V2_CACHE_CHECK_MAX_CONCURRENCY,)
+        );
+        let snapshot = coordinator
+            .validate_objects(&[sri_a.as_str(), sri_b.as_str()], store)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.performed_count, 2);
+        assert_eq!(snapshot.performed_hit_count, 2);
+        assert_eq!(snapshot.concurrency, 1);
     }
 }

@@ -114,12 +114,6 @@ struct FileCasFinishContext<'a> {
     validation_batch: Option<&'a ReusableObjectValidationBatch>,
 }
 
-fn file_exceeds_hybrid_buffer(reader: &std::io::BufReader<std::fs::File>) -> bool {
-    reader.get_ref().metadata().is_ok_and(|metadata| {
-        metadata.is_file() && metadata.len() > lpm_extractor::MAX_HYBRID_BUFFERED_COMPRESSED_SIZE
-    })
-}
-
 /// Whether a downloaded file is too large, compressed or as its gzip
 /// trailer declares it decoded, to buffer where the pipelined decoder can
 /// take it instead and write its files in parallel.
@@ -1552,10 +1546,10 @@ impl Store {
         let extract_start = std::time::Instant::now();
         let source_analysis_enabled = self.security_analysis_policy.is_enabled();
         let analyzer = std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
-        let registry_cas_ingest = match (self.file_cas.as_ref(), registry_identity) {
-            (Some(cas), Some((object_dir, sri))) => Some(std::cell::RefCell::new(
-                cas.begin_registry_ingest(object_dir, sri)?,
-            )),
+        let mut registry_cas_ingest = match (self.file_cas.as_ref(), registry_identity) {
+            (Some(cas), Some((object_dir, sri))) => {
+                Some(cas.begin_registry_ingest(object_dir, sri)?)
+            }
             (Some(_), None) => {
                 return Err(LpmError::Store(
                     "streamed object ingest is unavailable for the v3 file CAS".into(),
@@ -1563,33 +1557,7 @@ impl Store {
             }
             (None, _) => None,
         };
-        let inspection_error = std::cell::RefCell::new(None);
         let inspect_entry = |entry: lpm_extractor::EntryInfo<'_>| {
-            if inspection_error.borrow().is_none()
-                && let (Some(ingest), Some(cas)) =
-                    (registry_cas_ingest.as_ref(), self.file_cas.as_ref())
-            {
-                let result = entry
-                    .blake3_digest
-                    .ok_or_else(|| {
-                        LpmError::Store(format!(
-                            "v3 CAS extraction omitted a digest for {}",
-                            entry.relative_path.display()
-                        ))
-                    })
-                    .and_then(|digest| {
-                        cas.ingest_registry_file(
-                            &mut ingest.borrow_mut(),
-                            tmp_dir,
-                            entry.relative_path,
-                            entry.size,
-                            digest,
-                        )
-                    });
-                if let Err(error) = result {
-                    *inspection_error.borrow_mut() = Some(error);
-                }
-            }
             if !source_analysis_enabled {
                 return;
             }
@@ -1608,7 +1576,7 @@ impl Store {
             source_analysis_enabled
                 && lpm_security::behavioral::PackageAnalyzer::should_buffer_source(path, size)
         };
-        let extract_result = if !source_analysis_enabled && registry_cas_ingest.is_none() {
+        let extract_result = if !source_analysis_enabled {
             let pipeline_file = matches!(&tarball_input, TarballInput::File(reader) if file_takes_pipelined_decoder(reader));
             match &mut tarball_input {
                 TarballInput::Bytes(bytes) => {
@@ -1641,7 +1609,7 @@ impl Store {
                 ),
             }
         } else {
-            let stream_file = matches!(&tarball_input, TarballInput::File(reader) if file_exceeds_hybrid_buffer(reader));
+            let pipeline_file = matches!(&tarball_input, TarballInput::File(reader) if file_takes_pipelined_decoder(reader));
             match &mut tarball_input {
                 TarballInput::Bytes(bytes) => lpm_extractor::extract_tarball_with_entry_digests(
                     bytes,
@@ -1649,12 +1617,13 @@ impl Store {
                     buffer_predicate,
                     inspect_entry,
                 ),
-                TarballInput::File(reader) if stream_file => {
-                    lpm_extractor::extract_tarball_from_reader_streaming_with_entry_digests(
+                TarballInput::File(reader) if pipeline_file => {
+                    lpm_extractor::extract_tarball_from_reader_pipelined_with_entry_digests(
                         reader,
                         tmp_dir,
                         buffer_predicate,
                         inspect_entry,
+                        || {},
                     )
                 }
                 TarballInput::File(reader) => {
@@ -1673,20 +1642,20 @@ impl Store {
                         inspect_entry,
                     )
                 }
-                TarballInput::PipelinedStreaming { reader, .. } => {
-                    lpm_extractor::extract_tarball_from_reader_streaming_with_entry_digests(
-                        &mut **reader,
-                        tmp_dir,
-                        buffer_predicate,
-                        inspect_entry,
-                    )
-                }
+                TarballInput::PipelinedStreaming {
+                    reader,
+                    cancel_input,
+                    ..
+                } => lpm_extractor::extract_tarball_from_reader_pipelined_with_entry_digests(
+                    &mut **reader,
+                    tmp_dir,
+                    buffer_predicate,
+                    inspect_entry,
+                    cancel_input,
+                ),
             }
         };
         let extracted_files = extract_result?;
-        if let Some(error) = inspection_error.into_inner() {
-            return Err(error);
-        }
 
         let computed_sri = match &mut tarball_input {
             TarballInput::Streaming {
@@ -1711,6 +1680,22 @@ impl Store {
             TarballInput::Bytes(_) | TarballInput::File(_) => None,
         };
         timings.extract_ms = extract_start.elapsed().as_millis();
+
+        // Ingest deduplicated extracted files into the v3 CAS after streamed
+        // integrity verification succeeds and before `StreamedTreeBuilder`
+        // records final metadata integrities (hardlinking updates file ctimes).
+        if let (Some(cas), Some(ingest)) = (self.file_cas.as_ref(), registry_cas_ingest.as_mut()) {
+            for extracted in &extracted_files {
+                cas.ingest_registry_file(
+                    ingest,
+                    tmp_dir,
+                    &extracted.relative_path,
+                    Some(extracted.size),
+                    extracted.blake3_digest,
+                    extracted.source_stamp,
+                )?;
+            }
+        }
 
         tracing::event!(name: "finalize_admission_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let finalize_permit_wait_start = std::time::Instant::now();
@@ -1744,7 +1729,7 @@ impl Store {
             Some(ingest) => self
                 .file_cas
                 .as_ref()
-                .map(|cas| cas.finish_registry_ingest(ingest.into_inner()))
+                .map(|cas| cas.finish_registry_ingest(ingest))
                 .transpose()?,
             None => None,
         };
@@ -2466,6 +2451,7 @@ impl Store {
                 policy,
                 fresh_object_integrity: fresh_object_digest,
                 tree_digest: cas_tree_digest.as_deref(),
+                allow_parallel_files: !self.uses_serialized_volume_metadata(),
             },
             &deps,
             &platform,
@@ -3403,11 +3389,19 @@ impl Store {
             ));
         }
 
+        let materialized_entries = cas.materialized_entry_dirs()?;
+        let materialized_digests: std::collections::HashSet<String> = materialized_entries
+            .iter()
+            .filter_map(|entry_dir| cas.materialized_digest_from_entry(entry_dir).ok())
+            .collect();
+
         let tree_files = cas.tree_manifest_files()?;
         verification.trees = tree_files.len();
         let mut all_tree_blobs = std::collections::HashSet::new();
-        let mut reachable_blob_paths = std::collections::HashSet::new();
-        let mut tree_manifests = std::collections::HashMap::new();
+        let mut reachable_blob_ids: std::collections::HashSet<crate::v3::CompactBlobKey> =
+            std::collections::HashSet::new();
+        let mut tree_manifests =
+            std::collections::HashMap::with_capacity(materialized_digests.len());
         for tree_path in &tree_files {
             let (digest, manifest) = match cas.manifest_from_file(tree_path) {
                 Ok(manifest) => manifest,
@@ -3420,16 +3414,18 @@ impl Store {
                 verification.orphaned_trees = verification.orphaned_trees.saturating_add(1);
             }
             let tree_is_reachable = reachable_tree_digests.contains(&digest);
-            tree_manifests.insert(digest, manifest.clone());
+            if materialized_digests.contains(&digest) {
+                tree_manifests.insert(digest, manifest.clone());
+            }
             for key in manifest
                 .entries
                 .iter()
                 .filter_map(|entry| entry.blob.as_ref())
             {
-                match cas.blob_path(key) {
-                    Ok(path) => {
+                match cas.compact_blob_key(&key.digest, key.mode) {
+                    Ok(compact) => {
                         if tree_is_reachable {
-                            reachable_blob_paths.insert(path);
+                            reachable_blob_ids.insert(compact);
                         }
                         all_tree_blobs.insert(key.clone());
                     }
@@ -3438,7 +3434,6 @@ impl Store {
             }
         }
 
-        let materialized_entries = cas.materialized_entry_dirs()?;
         verification.materialized = materialized_entries.len();
         for entry_dir in &materialized_entries {
             let digest = match cas.materialized_digest_from_entry(entry_dir) {
@@ -3474,8 +3469,13 @@ impl Store {
 
         let blob_files = cas.blob_files()?;
         verification.blobs = blob_files.len();
-        let mut hash_buffer = vec![0_u8; 64 * 1024];
-        let mut verified_blob_paths = std::collections::HashSet::with_capacity(blob_files.len());
+        let mut verified_blob_ids: std::collections::HashSet<(crate::v3::CompactBlobKey, u64)> =
+            std::collections::HashSet::with_capacity(blob_files.len());
+        let mut deep_checks: Vec<(&Path, crate::v3::BlobKey)> = if deep {
+            Vec::with_capacity(blob_files.len())
+        } else {
+            Vec::new()
+        };
         for blob_path in &blob_files {
             let key = match cas.blob_key_from_file(blob_path) {
                 Ok(key) => key,
@@ -3484,20 +3484,79 @@ impl Store {
                     continue;
                 }
             };
-            verified_blob_paths.insert(blob_path.clone());
-            if !reachable_blob_paths.contains(blob_path) {
+            let compact = match cas.compact_blob_key(&key.digest, key.mode) {
+                Ok(compact) => compact,
+                Err(error) => {
+                    verification.issues.push(error.to_string());
+                    continue;
+                }
+            };
+            verified_blob_ids.insert((compact, key.size));
+            if !reachable_blob_ids.contains(&compact) {
                 verification.orphaned_blobs = verification.orphaned_blobs.saturating_add(1);
             }
             if deep {
-                verification.blobs_rehashed = verification.blobs_rehashed.saturating_add(1);
-                if let Err(error) = cas.verify_blob(&key, true, &mut hash_buffer) {
-                    verification.issues.push(error.to_string());
+                deep_checks.push((blob_path.as_path(), key));
+            }
+        }
+
+        let mut hash_buffer = vec![0_u8; 64 * 1024];
+        if deep && !deep_checks.is_empty() {
+            const PARALLEL_DEEP_VERIFY_THRESHOLD: usize = 16;
+            verification.blobs_rehashed = verification
+                .blobs_rehashed
+                .saturating_add(deep_checks.len());
+            let workers = lpm_common::resources::effective_cpu_count().min(8);
+            if deep_checks.len() >= PARALLEL_DEEP_VERIFY_THRESHOLD && workers > 1 {
+                let next_index = std::sync::atomic::AtomicUsize::new(0);
+                let desired_helpers = workers.min(deep_checks.len()).saturating_sub(1);
+                let run_worker = || {
+                    let mut local_buf = vec![0_u8; 64 * 1024];
+                    let mut local_issues = Vec::new();
+                    loop {
+                        let idx = next_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((blob_path, key)) = deep_checks.get(idx) else {
+                            break;
+                        };
+                        if let Err(error) = cas.verify_blob_at_path(blob_path, key, &mut local_buf)
+                        {
+                            local_issues.push(error.to_string());
+                        }
+                    }
+                    local_issues
+                };
+                let deep_issues = std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(desired_helpers);
+                    for _ in 0..desired_helpers {
+                        match std::thread::Builder::new().spawn_scoped(scope, run_worker) {
+                            Ok(handle) => handles.push(handle),
+                            Err(_) => break,
+                        }
+                    }
+                    let mut merged = run_worker();
+                    for handle in handles {
+                        match handle.join() {
+                            Ok(issues) => merged.extend(issues),
+                            Err(_) => {
+                                merged.push("v3 CAS deep verification worker panicked".into());
+                            }
+                        }
+                    }
+                    merged
+                });
+                verification.issues.extend(deep_issues);
+            } else {
+                for (blob_path, key) in &deep_checks {
+                    if let Err(error) = cas.verify_blob_at_path(blob_path, key, &mut hash_buffer) {
+                        verification.issues.push(error.to_string());
+                    }
                 }
             }
         }
+
         for key in &all_tree_blobs {
-            let path = cas.blob_path(key)?;
-            if verified_blob_paths.contains(&path) {
+            let compact = cas.compact_blob_key(&key.digest, key.mode)?;
+            if verified_blob_ids.contains(&(compact, key.size)) {
                 continue;
             }
             if let Err(error) = cas.verify_blob(key, deep, &mut hash_buffer) {
@@ -3529,7 +3588,8 @@ impl Store {
             .map(PathBuf::as_path)
             .collect::<std::collections::HashSet<_>>();
         let mut reachable_trees = std::collections::HashMap::new();
-        let mut reachable_blobs = std::collections::HashSet::new();
+        let mut reachable_blobs: std::collections::HashSet<crate::v3::CompactBlobKey> =
+            std::collections::HashSet::new();
         let mut live_source_digests = std::collections::HashSet::new();
         for (object_dir, _) in self.object_dirs_for_prune()? {
             if objects_to_remove.contains(object_dir.as_path()) {
@@ -3565,7 +3625,7 @@ impl Store {
                 )));
             }
             for blob in manifest.entries.into_iter().filter_map(|entry| entry.blob) {
-                reachable_blobs.insert(cas.blob_path(&blob)?);
+                reachable_blobs.insert(cas.compact_blob_key(&blob.digest, blob.mode)?);
             }
             reachable_trees.insert(record.tree_digest, record.local_source);
         }
@@ -3621,6 +3681,7 @@ struct PopulateObject<'a> {
     policy: ObjectIntegrityPolicy,
     fresh_object_integrity: Option<&'a FreshObjectIntegrity>,
     tree_digest: Option<&'a str>,
+    allow_parallel_files: bool,
 }
 
 struct PopulateIntoResult {
@@ -3672,6 +3733,7 @@ fn populate_into(
         &pkg_dir,
         has_local_source_sentinel(object.dir),
         object.fresh_object_integrity.is_none(),
+        object.allow_parallel_files,
     )?;
     timings.materialize_ms = materialize_start.elapsed().as_millis();
 
@@ -4437,15 +4499,10 @@ fn dependency_links_match(
         };
         if actual != expected {
             #[cfg(windows)]
-            if actual.is_absolute() {
-                let parent = link
-                    .parent()
-                    .ok_or_else(|| LpmError::Store("dependency link has no parent".into()))?;
-                if normalized_link_target(&actual)?
-                    == normalized_link_target(&parent.join(&expected))?
-                {
-                    continue;
-                }
+            if actual.is_absolute()
+                && lpm_common::link_targets_equivalent(&actual, &link, &expected)
+            {
+                continue;
             }
             return Ok(false);
         }
@@ -4534,22 +4591,6 @@ fn wrapper_slots_match(
         }
     }
     Ok(found == expected.len())
-}
-
-#[cfg(windows)]
-fn normalized_link_target(path: &Path) -> Result<PathBuf, LpmError> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    lpm_common::paths::absolute_extended_path(&normalized)
-        .map_err(|error| LpmError::Store(error.to_string()))
 }
 
 fn link_entry_package_dir(dir: &Path, key: &GraphKey) -> PathBuf {
@@ -4653,6 +4694,26 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Returns `true` when the store lives on a filesystem whose volume-wide
+    /// metadata lock serializes concurrent directory writes and removals
+    /// (macOS APFS and Linux btrfs).
+    pub fn uses_serialized_volume_metadata(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            true
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.needs_linux_populate_cap()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn linux_statfs_type(path: &Path) -> Option<u64> {
     use std::ffi::CString;
@@ -4670,6 +4731,30 @@ fn linux_statfs_type(path: &Path) -> Option<u64> {
     }
     // SAFETY: `statfs` initialized `stats` on success.
     Some(unsafe { stats.assume_init().f_type } as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo_bytes(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == b'\\'
+            && index + 3 < raw.len()
+            && matches!(raw[index + 1], b'0'..=b'3')
+            && matches!(raw[index + 2], b'0'..=b'7')
+            && matches!(raw[index + 3], b'0'..=b'7')
+        {
+            let value = ((raw[index + 1] - b'0') << 6)
+                | ((raw[index + 2] - b'0') << 3)
+                | (raw[index + 3] - b'0');
+            out.push(value);
+            index += 4;
+        } else {
+            out.push(raw[index]);
+            index += 1;
+        }
+    }
+    out
 }
 
 #[cfg(target_os = "linux")]
@@ -4692,7 +4777,9 @@ fn linux_overlay_upperdir_from_mountinfo(path: &Path, mountinfo: &[u8]) -> Optio
         if fields.get(sep + 1).copied() != Some(b"overlay") {
             continue;
         }
-        let mount_point = PathBuf::from(std::ffi::OsString::from_vec(mount_point_raw.to_vec()));
+        let mount_point = PathBuf::from(std::ffi::OsString::from_vec(unescape_mountinfo_bytes(
+            mount_point_raw,
+        )));
         if !canonical.starts_with(&mount_point) {
             continue;
         }
@@ -4710,11 +4797,100 @@ fn linux_overlay_upperdir_from_mountinfo(path: &Path, mountinfo: &[u8]) -> Optio
         {
             best = Some((
                 depth,
-                PathBuf::from(std::ffi::OsString::from_vec(upper_raw.to_vec())),
+                PathBuf::from(std::ffi::OsString::from_vec(unescape_mountinfo_bytes(
+                    upper_raw,
+                ))),
             ));
         }
     }
     best.map(|(_, upper)| upper)
+}
+
+#[cfg(target_os = "linux")]
+fn container_runtime_bind_root_prefix(upper: &Path) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = upper.as_os_str().as_bytes();
+    for (driver_marker, bind_subdir) in [
+        (b"/overlay2/".as_slice(), b"/containers/".as_slice()),
+        (b"/overlay/".as_slice(), b"/overlay-containers/".as_slice()),
+    ] {
+        if let Some(pos) = bytes
+            .windows(driver_marker.len())
+            .position(|window| window == driver_marker)
+            && pos > 0
+        {
+            let mut prefix = Vec::with_capacity(pos + bind_subdir.len());
+            prefix.extend_from_slice(&bytes[..pos]);
+            prefix.extend_from_slice(bind_subdir);
+            return Some(prefix);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_overlay_upperdir_is_btrfs_from_mountinfo(path: &Path, mountinfo: &[u8]) -> Option<bool> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let upper = linux_overlay_upperdir_from_mountinfo(path, mountinfo)?;
+    let expected_bind_prefix = container_runtime_bind_root_prefix(&upper);
+    let mut best_mount: Option<(usize, &[u8])> = None;
+    let mut best_container_bind: Option<(usize, &[u8])> = None;
+
+    for line in mountinfo
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
+        let Some(mount_root_raw) = fields.get(3).copied() else {
+            continue;
+        };
+        let Some(mount_point_raw) = fields.get(4).copied() else {
+            continue;
+        };
+        let Some(sep) = (6..fields.len()).find(|index| fields[*index] == b"-") else {
+            continue;
+        };
+        let Some(fs_type) = fields.get(sep + 1).copied() else {
+            continue;
+        };
+        if fs_type == b"overlay" {
+            continue;
+        }
+        let mount_point_bytes = unescape_mountinfo_bytes(mount_point_raw);
+        let mount_point = PathBuf::from(std::ffi::OsString::from_vec(mount_point_bytes.clone()));
+        if upper.starts_with(&mount_point) {
+            let depth = mount_point.as_os_str().len();
+            if best_mount
+                .as_ref()
+                .is_none_or(|(best_depth, _)| depth >= *best_depth)
+            {
+                best_mount = Some((depth, fs_type));
+            }
+        }
+        if let Some(bind_prefix) = expected_bind_prefix.as_deref()
+            && matches!(
+                mount_point_bytes.as_slice(),
+                b"/etc/resolv.conf" | b"/etc/hosts" | b"/etc/hostname"
+            )
+        {
+            let mount_root_bytes = unescape_mountinfo_bytes(mount_root_raw);
+            if mount_root_bytes.starts_with(bind_prefix) {
+                let depth = mount_root_bytes.len();
+                if best_container_bind
+                    .as_ref()
+                    .is_none_or(|(best_depth, _)| depth >= *best_depth)
+                {
+                    best_container_bind = Some((depth, fs_type));
+                }
+            }
+        }
+    }
+
+    best_mount
+        .or(best_container_bind)
+        .map(|(_, fs_type)| fs_type == b"btrfs")
 }
 
 #[cfg(target_os = "linux")]
@@ -4730,9 +4906,14 @@ fn linux_path_needs_populate_cap(path: &Path) -> bool {
             else {
                 return false;
             };
-            linux_overlay_upperdir_from_mountinfo(path, &mountinfo)
-                .and_then(|upper| linux_statfs_type(&upper))
-                == Some(BTRFS_SUPER_MAGIC)
+            if let Some(upper) = linux_overlay_upperdir_from_mountinfo(path, &mountinfo)
+                && upper.exists()
+                && let Some(fs_type) = linux_statfs_type(&upper)
+                && fs_type != OVERLAYFS_SUPER_MAGIC
+            {
+                return fs_type == BTRFS_SUPER_MAGIC;
+            }
+            linux_overlay_upperdir_is_btrfs_from_mountinfo(path, &mountinfo).unwrap_or(false)
         }
         _ => false,
     }

@@ -1,4 +1,4 @@
-use crate::{ExtractionRecord, PathLedgerBudget};
+use crate::{ExtractedFileStamp, ExtractionRecord, PathLedgerBudget};
 use lpm_common::LpmError;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -7,9 +7,9 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) struct Identity {
     device: i128,
     inode: i128,
@@ -39,7 +39,138 @@ struct Parent {
     identity: Identity,
 }
 
-const MAX_CACHED_PARENTS: usize = 16;
+const MIN_CACHED_PARENTS: usize = 4;
+const MAX_CACHED_PARENTS: usize = 32;
+
+fn parent_cache_capacity_for_limit(soft: u64, max_concurrent: usize) -> usize {
+    if soft < 128 {
+        return MIN_CACHED_PARENTS;
+    }
+    let per_extraction = (soft / 4) / (max_concurrent.max(1) as u64);
+    usize::try_from(per_extraction)
+        .unwrap_or(MAX_CACHED_PARENTS)
+        .clamp(MIN_CACHED_PARENTS, MAX_CACHED_PARENTS)
+}
+
+fn parent_cache_capacity() -> usize {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit initializes this valid out pointer on success.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return MIN_CACHED_PARENTS;
+    }
+    // SAFETY: getrlimit succeeded.
+    let soft = unsafe { limit.assume_init() }.rlim_cur;
+    let max_concurrent = lpm_common::resources::default_fetch_extract_permits(
+        lpm_common::resources::effective_cpu_count(),
+        lpm_common::resources::effective_memory_limit_bytes(),
+    );
+    parent_cache_capacity_for_limit(soft, max_concurrent)
+}
+
+fn is_descriptor_exhaustion(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+}
+
+struct LruNode {
+    parent: Parent,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+struct ParentCache {
+    nodes: Vec<Option<LruNode>>,
+    free_slots: Vec<usize>,
+    index: HashMap<PathBuf, usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    capacity: usize,
+}
+
+impl ParentCache {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            nodes: Vec::with_capacity(capacity),
+            free_slots: Vec::new(),
+            index: HashMap::with_capacity(capacity),
+            head: None,
+            tail: None,
+            capacity,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.free_slots.clear();
+        self.index.clear();
+        self.head = None;
+        self.tail = None;
+    }
+
+    fn unlink(&mut self, slot: usize) -> Parent {
+        let node = self.nodes[slot].take().expect("LRU slot must be occupied");
+        match node.prev {
+            Some(prev) => {
+                if let Some(prev_node) = self.nodes[prev].as_mut() {
+                    prev_node.next = node.next;
+                }
+            }
+            None => self.head = node.next,
+        }
+        match node.next {
+            Some(next) => {
+                if let Some(next_node) = self.nodes[next].as_mut() {
+                    next_node.prev = node.prev;
+                }
+            }
+            None => self.tail = node.prev,
+        }
+        self.free_slots.push(slot);
+        node.parent
+    }
+
+    fn take(&mut self, path: &Path) -> Option<Parent> {
+        let slot = self.index.remove(path)?;
+        Some(self.unlink(slot))
+    }
+
+    fn insert(&mut self, parent: Parent) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let Some(existing) = self.index.remove(&parent.path) {
+            let _ = self.unlink(existing);
+        } else if self.index.len() >= self.capacity
+            && let Some(lru_slot) = self.tail
+        {
+            let evicted = self.unlink(lru_slot);
+            self.index.remove(&evicted.path);
+        }
+        let path_key = parent.path.clone();
+        let old_head = self.head;
+        let node = LruNode {
+            parent,
+            prev: None,
+            next: old_head,
+        };
+        let slot = if let Some(slot) = self.free_slots.pop() {
+            self.nodes[slot] = Some(node);
+            slot
+        } else {
+            let slot = self.nodes.len();
+            self.nodes.push(Some(node));
+            slot
+        };
+        if let Some(head_slot) = old_head
+            && let Some(head_node) = self.nodes[head_slot].as_mut()
+        {
+            head_node.prev = Some(slot);
+        } else {
+            self.tail = Some(slot);
+        }
+        self.head = Some(slot);
+        self.index.insert(path_key, slot);
+    }
+}
 
 pub(crate) struct OutputTree {
     root_path: PathBuf,
@@ -47,22 +178,28 @@ pub(crate) struct OutputTree {
     root: Arc<File>,
     root_identity: Identity,
     directories: HashMap<PathBuf, DirectoryRecord>,
+    directory_identities: HashMap<Identity, PathBuf>,
     parent: Option<Parent>,
-    recent_parents: Vec<Parent>,
+    recent_parents: Arc<Mutex<ParentCache>>,
 }
 
 impl OutputTree {
     pub(crate) fn new(root_path: PathBuf, visible_root_path: PathBuf) -> Result<Self, LpmError> {
         let root = open_directory(libc::AT_FDCWD, &c_path(&root_path)?)?;
         let root_identity = Identity::from_metadata(&root.metadata()?);
+        let mut directory_identities = HashMap::with_capacity(64);
+        directory_identities.insert(root_identity, PathBuf::new());
         Ok(Self {
             root_path,
             visible_root_path,
             root: Arc::new(root),
             root_identity,
             directories: HashMap::with_capacity(64),
+            directory_identities,
             parent: None,
-            recent_parents: Vec::with_capacity(MAX_CACHED_PARENTS),
+            recent_parents: Arc::new(Mutex::new(ParentCache::with_capacity(
+                parent_cache_capacity(),
+            ))),
         })
     }
 
@@ -70,16 +207,10 @@ impl OutputTree {
         let Some(previous) = self.parent.take() else {
             return;
         };
-        if let Some(pos) = self
-            .recent_parents
-            .iter()
-            .position(|cached| cached.path == previous.path)
-        {
-            self.recent_parents.remove(pos);
-        } else if self.recent_parents.len() >= MAX_CACHED_PARENTS {
-            self.recent_parents.remove(0);
-        }
-        self.recent_parents.push(previous);
+        self.recent_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(previous);
     }
 
     pub(crate) fn prepare_parent(
@@ -100,35 +231,54 @@ impl OutputTree {
             return Ok(());
         }
         self.park_current_parent();
-        if let Some(pos) = self
+        let taken = self
             .recent_parents
-            .iter()
-            .position(|cached| cached.path == parent)
-        {
-            let cached = self.recent_parents.remove(pos);
-            if self
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(parent);
+        if let Some(cached) = taken
+            && self
                 .directories
                 .get(parent)
                 .is_some_and(|record| record.identity == cached.identity)
-            {
-                self.parent = Some(cached);
+        {
+            self.parent = Some(cached);
+            return Ok(());
+        }
+        if let Some(record) = self.directories.get(parent) {
+            let opened = match open_known_parent(&self.root, parent) {
+                Ok(opened) => opened,
+                Err(error) if is_descriptor_exhaustion(&error) => {
+                    let evicted = {
+                        let mut recent = self
+                            .recent_parents
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let had_entries = !recent.index.is_empty();
+                        recent.clear();
+                        had_entries
+                    };
+                    if evicted {
+                        open_known_parent(&self.root, parent)?
+                    } else {
+                        return Err(error.into());
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if let Some((directory, name)) = opened {
+                let identity = Identity::from_metadata(&directory.metadata()?);
+                if identity != record.identity {
+                    return Err(changed_directory(parent));
+                }
+                self.parent = Some(Parent {
+                    path: parent.to_path_buf(),
+                    name,
+                    file: Arc::new(directory),
+                    identity,
+                });
                 return Ok(());
             }
-        }
-        if let Some(record) = self.directories.get(parent)
-            && let Some((directory, name)) = open_known_parent(&self.root, parent)?
-        {
-            let identity = Identity::from_metadata(&directory.metadata()?);
-            if identity != record.identity {
-                return Err(changed_directory(parent));
-            }
-            self.parent = Some(Parent {
-                path: parent.to_path_buf(),
-                name,
-                file: Arc::new(directory),
-                identity,
-            });
-            return Ok(());
         }
         let mut current = None::<File>;
         let mut prefix = PathBuf::with_capacity(parent.as_os_str().len());
@@ -138,12 +288,32 @@ impl OutputTree {
             let name = CString::new(component.as_os_str().as_bytes()).map_err(invalid_path)?;
             let base = current.as_ref().unwrap_or(&self.root).as_raw_fd();
             let known = self.directories.get(&prefix);
-            let (next, created) = match open_directory(base, &name) {
+            let open_or_retry = || match open_directory(base, &name) {
+                Ok(next) => Ok(next),
+                Err(error) if is_descriptor_exhaustion(&error) => {
+                    let evicted = {
+                        let mut recent = self
+                            .recent_parents
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let had_entries = !recent.index.is_empty();
+                        recent.clear();
+                        had_entries
+                    };
+                    if evicted {
+                        open_directory(base, &name)
+                    } else {
+                        Err(error)
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            let (next, created) = match open_or_retry() {
                 Ok(next) => (next, false),
                 Err(error) if error.kind() == io::ErrorKind::NotFound && known.is_none() => {
                     budget.reserve(&prefix)?;
                     mkdir(base, &name)?;
-                    match open_directory(base, &name) {
+                    match open_or_retry() {
                         Ok(directory) => (directory, true),
                         Err(error) => {
                             let _ = unlink(base, &name, libc::AT_REMOVEDIR);
@@ -159,11 +329,21 @@ impl OutputTree {
                     return Err(changed_directory(&prefix));
                 }
             } else {
+                if let Some(existing_dir) = self.directory_identities.get(&identity)
+                    && existing_dir != &prefix
+                {
+                    return Err(LpmError::Registry(format!(
+                        "directory path collision in tarball: {} aliases {}",
+                        prefix.display(),
+                        existing_dir.display()
+                    )));
+                }
                 if !created {
                     budget.reserve(&prefix)?;
                 }
                 self.directories
                     .insert(prefix.clone(), DirectoryRecord { identity, created });
+                self.directory_identities.insert(identity, prefix.clone());
             }
             current = Some(next);
         }
@@ -203,6 +383,7 @@ impl OutputTree {
             directory: Arc::clone(directory),
             name: CString::new(leaf.as_bytes()).map_err(invalid_path)?,
             path: path.to_path_buf(),
+            recent_parents: Arc::downgrade(&self.recent_parents),
         })
     }
 
@@ -254,7 +435,10 @@ impl OutputTree {
 
     pub(crate) fn validate(&mut self) -> Result<(), LpmError> {
         self.parent = None;
-        self.recent_parents.clear();
+        self.recent_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.validate_root()?;
         for (path, record) in &self.directories {
             if let Some((directory, _)) = open_known_parent(&self.root, path)? {
@@ -284,6 +468,10 @@ impl OutputTree {
 
     pub(crate) fn cleanup<E: ExtractionRecord>(&mut self, files: &[E], identities: &[Identity]) {
         self.parent = None;
+        self.recent_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         if files.len() != identities.len() {
             return;
         }
@@ -342,12 +530,14 @@ pub(crate) struct NewFile {
     directory: Arc<File>,
     name: CString,
     path: PathBuf,
+    recent_parents: Weak<Mutex<ParentCache>>,
 }
 
 impl NewFile {
-    /// Create or truncate the file without following a symlink at its name.
+    /// Create a brand-new regular file without following a symlink or
+    /// overwriting an already-existing aliased entry (e.g. APFS NFC/NFD).
     pub(crate) fn create(self) -> Result<PendingFile, LpmError> {
-        self.open(libc::O_TRUNC)
+        self.open(libc::O_EXCL)
     }
 
     /// Remove the regular file an earlier entry wrote at this name, then create it.
@@ -366,8 +556,38 @@ impl NewFile {
 
     fn open(self, mode_flag: i32) -> Result<PendingFile, LpmError> {
         let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | mode_flag;
-        let file = open_at(self.directory.as_raw_fd(), &self.name, flags, 0o666)
-            .map_err(|error| path_error(error, &self.path))?;
+        let base = self.directory.as_raw_fd();
+        let open_result = match open_at(base, &self.name, flags, 0o666) {
+            Ok(file) => Ok(file),
+            Err(error) if is_descriptor_exhaustion(&error) => {
+                let evicted = self.recent_parents.upgrade().is_some_and(|cache| {
+                    let mut recent = cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let had_entries = !recent.index.is_empty();
+                    recent.clear();
+                    had_entries
+                });
+                if evicted {
+                    open_at(base, &self.name, flags, 0o666)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let file = open_result.map_err(|error| {
+            // POSIX specifies EEXIST for O_CREAT|O_EXCL|O_NOFOLLOW on an
+            // existing symlink; classify symlinks as ELOOP so callers still
+            // receive LpmError::PathTraversal.
+            if error.kind() == io::ErrorKind::AlreadyExists
+                && let Ok(meta) = stat_at(base, &self.name)
+                && (meta.st_mode & libc::S_IFMT) == libc::S_IFLNK
+            {
+                return path_error(io::Error::from_raw_os_error(libc::ELOOP), &self.path);
+            }
+            path_error(error, &self.path)
+        })?;
         Ok(PendingFile {
             file,
             directory: self.directory,
@@ -375,6 +595,47 @@ impl NewFile {
             committed: false,
         })
     }
+}
+
+fn unix_timespec_to_ns(secs: i64, nsec: i64) -> Option<u64> {
+    u64::try_from(secs)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(nsec).ok()?)
+}
+
+fn unix_stamp_from_metadata(meta: &Metadata) -> Option<ExtractedFileStamp> {
+    Some(ExtractedFileStamp {
+        identity: lpm_common::FileIdentity {
+            volume: meta.dev(),
+            file_id: u128::from(meta.ino()),
+        },
+        size: meta.len(),
+        mode: meta.mode() & 0o7777,
+        mtime_ns: unix_timespec_to_ns(meta.mtime(), meta.mtime_nsec())?,
+        ctime_ns: unix_timespec_to_ns(meta.ctime(), meta.ctime_nsec())?,
+    })
+}
+
+fn unix_stamp_from_stat(current: &libc::stat) -> Option<ExtractedFileStamp> {
+    let volume = u64::try_from(i128::from(current.st_dev)).ok()?;
+    let ino = u64::try_from(i128::from(current.st_ino)).ok()?;
+    let size = u64::try_from(i128::from(current.st_size)).ok()?;
+    let mode = u32::try_from(i128::from(current.st_mode)).ok()? & 0o7777;
+    let mtime = i64::try_from(i128::from(current.st_mtime)).ok()?;
+    let mtime_nsec = i64::try_from(i128::from(current.st_mtime_nsec)).ok()?;
+    let ctime = i64::try_from(i128::from(current.st_ctime)).ok()?;
+    let ctime_nsec = i64::try_from(i128::from(current.st_ctime_nsec)).ok()?;
+    Some(ExtractedFileStamp {
+        identity: lpm_common::FileIdentity {
+            volume,
+            file_id: u128::from(ino),
+        },
+        size,
+        mode,
+        mtime_ns: unix_timespec_to_ns(mtime, mtime_nsec)?,
+        ctime_ns: unix_timespec_to_ns(ctime, ctime_nsec)?,
+    })
 }
 
 pub(crate) struct PendingFile {
@@ -405,6 +666,15 @@ impl PendingFile {
             pending: self,
             identity,
         })
+    }
+    pub(crate) fn commit_with_stamp(
+        mut self,
+    ) -> Result<(Identity, Option<ExtractedFileStamp>), LpmError> {
+        let meta = self.file.metadata()?;
+        let identity = Identity::from_metadata(&meta);
+        let stamp = unix_stamp_from_metadata(&meta);
+        self.committed = true;
+        Ok((identity, stamp))
     }
     pub(crate) fn commit(mut self) {
         self.committed = true;
@@ -438,7 +708,7 @@ pub(crate) struct CompletedFile {
 }
 
 impl CompletedFile {
-    pub(crate) fn commit(self) -> Result<Identity, LpmError> {
+    pub(crate) fn verify_for_commit(&self) -> Result<Option<ExtractedFileStamp>, LpmError> {
         let current = stat_at(self.pending.directory.as_raw_fd(), &self.pending.name)?;
         if current.st_mode & libc::S_IFMT != libc::S_IFREG
             || self.identity != Identity::from_stat(&current)
@@ -447,8 +717,19 @@ impl CompletedFile {
                 "tarball output file changed before acceptance".into(),
             ));
         }
+        Ok(unix_stamp_from_stat(&current))
+    }
+
+    pub(crate) fn finish_commit(self) -> Identity {
+        let identity = self.identity;
         self.pending.commit();
-        Ok(self.identity)
+        identity
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit(self) -> Result<(Identity, Option<ExtractedFileStamp>), LpmError> {
+        let stamp = self.verify_for_commit()?;
+        Ok((self.finish_commit(), stamp))
     }
 }
 
@@ -696,5 +977,120 @@ mod tests {
         ] {
             assert!(!confined_open_unavailable(error), "{error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod parent_cache_tests {
+    use super::*;
+
+    fn dummy_parent(file: &Arc<File>, name: &str, inode: i128) -> Parent {
+        Parent {
+            path: PathBuf::from(name),
+            name: CString::new(name).unwrap(),
+            file: Arc::clone(file),
+            identity: Identity { device: 1, inode },
+        }
+    }
+
+    #[test]
+    fn parent_cache_evicts_least_recently_used_entry_in_constant_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = Arc::new(File::open(dir.path()).unwrap());
+        let mut cache = ParentCache::with_capacity(3);
+        cache.insert(dummy_parent(&file, "a", 1));
+        cache.insert(dummy_parent(&file, "b", 2));
+        cache.insert(dummy_parent(&file, "c", 3));
+
+        // Promote `a` by taking and re-inserting it, then insert `d` so `b` is evicted.
+        let promoted = cache.take(Path::new("a")).unwrap();
+        assert_eq!(promoted.identity.inode, 1);
+        cache.insert(promoted);
+        cache.insert(dummy_parent(&file, "d", 4));
+
+        assert!(cache.take(Path::new("b")).is_none());
+        assert_eq!(cache.take(Path::new("a")).unwrap().identity.inode, 1);
+        assert_eq!(cache.take(Path::new("c")).unwrap().identity.inode, 3);
+        assert_eq!(cache.take(Path::new("d")).unwrap().identity.inode, 4);
+    }
+
+    #[test]
+    fn parent_cache_capacity_leaves_descriptor_headroom_for_concurrent_extractions() {
+        let at_512 = parent_cache_capacity_for_limit(512, 8);
+        assert!(
+            at_512 * 8 <= 128,
+            "8 concurrent extractions at RLIMIT_NOFILE=512 must stay within 25% of soft limit, got {at_512} each"
+        );
+        assert_eq!(parent_cache_capacity_for_limit(64, 8), MIN_CACHED_PARENTS);
+        assert_eq!(
+            parent_cache_capacity_for_limit(10_240, 4),
+            MAX_CACHED_PARENTS
+        );
+    }
+
+    #[test]
+    fn root_file_creation_evicts_cached_parent_dirfds_on_emfile() {
+        const CHILD: &str = "LPM_TEST_ROOT_FILE_EMFILE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "output::unix::parent_cache_tests::root_file_creation_evicts_cached_parent_dirfds_on_emfile",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is valid writable storage for `getrlimit`.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let tight = libc::rlimit {
+            rlim_cur: 64.min(limit.rlim_max),
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: lowering soft limit to <= hard limit in this isolated child process.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &tight) }, 0);
+
+        let mut output =
+            OutputTree::new(dir.path().to_path_buf(), dir.path().to_path_buf()).unwrap();
+        let mut budget = PathLedgerBudget::new(1024 * 1024);
+        for idx in 0..16 {
+            let rel = PathBuf::from(format!("sub{idx}/file.js"));
+            output.prepare_parent(&rel, &mut budget).unwrap();
+            let pending = output.create_file(&rel, false).unwrap();
+            pending.commit();
+        }
+        // Park the last parent into recent_parents by preparing a root-level file.
+        let root_file = Path::new("root-entry.js");
+        output.prepare_parent(root_file, &mut budget).unwrap();
+
+        // Exhaust all remaining file descriptors until opening fails with EMFILE.
+        let mut fillers = Vec::new();
+        while let Ok(f) = File::open(dir.path()) {
+            fillers.push(f);
+        }
+
+        // Creating the root-level file must evict cached parent dirfds and succeed.
+        let pending = output
+            .create_file(root_file, false)
+            .expect("file creation must evict cached parent dirfds on EMFILE");
+        pending.commit();
+        drop(fillers);
     }
 }

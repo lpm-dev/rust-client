@@ -133,18 +133,25 @@ fn walk_directory_source(
 /// 2. Hardlink (same filesystem, zero disk cost, shared inode)
 /// 3. Copy (fallback for cross-device or permissions)
 pub(crate) fn link_dir_recursive(src: &Path, dst: &Path) -> Result<(), LpmError> {
-    materialize_dir_recursive(src, dst, true)
+    materialize_dir_recursive(src, dst, true, false)
 }
 
 /// Recursively copy a directory without sharing writable file inodes.
-pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), LpmError> {
-    materialize_dir_recursive(src, dst, false)
+/// `warm_source` should only be `true` when the source link entry existed
+/// before this install (avoiding writeback stalls on dirty pages under XFS/btrfs).
+pub(crate) fn copy_dir_recursive(
+    src: &Path,
+    dst: &Path,
+    warm_source: bool,
+) -> Result<(), LpmError> {
+    materialize_dir_recursive(src, dst, false, warm_source)
 }
 
 fn materialize_dir_recursive(
     src: &Path,
     dst: &Path,
     allow_hardlinks: bool,
+    warm_source: bool,
 ) -> Result<(), LpmError> {
     // On macOS, try clonefile first (copies entire directory tree as CoW in one syscall)
     #[cfg(target_os = "macos")]
@@ -164,7 +171,7 @@ fn materialize_dir_recursive(
 
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            materialize_dir_recursive(&src_path, &dst_path, allow_hardlinks)?;
+            materialize_dir_recursive(&src_path, &dst_path, allow_hardlinks, warm_source)?;
         } else if file_type.is_symlink() {
             return Err(LpmError::Store(format!(
                 "refusing to follow symlink while linking package store entry: {}",
@@ -172,7 +179,7 @@ fn materialize_dir_recursive(
             )));
         } else if file_type.is_file() {
             if !allow_hardlinks {
-                copy_regular_file(&src_path, &dst_path)?;
+                copy_regular_file(&src_path, &dst_path, warm_source)?;
             } else if let Err(e) = std::fs::hard_link(&src_path, &dst_path) {
                 // Hardlink refusals fall into a few classes: cross-volume
                 // mounts, permissions, and Windows junctions inside the CAS
@@ -184,7 +191,7 @@ fn materialize_dir_recursive(
                     error = %e,
                     "link_dir_recursive: hardlink failed, falling back to copy",
                 );
-                copy_regular_file(&src_path, &dst_path)?;
+                copy_regular_file(&src_path, &dst_path, false)?;
             }
         }
     }
@@ -192,14 +199,19 @@ fn materialize_dir_recursive(
     Ok(())
 }
 
-fn copy_regular_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
+fn copy_regular_file(src: &Path, dst: &Path, warm_source: bool) -> Result<(), LpmError> {
     #[cfg(target_os = "linux")]
     {
-        lpm_store::v2::linux_copy_file_io(src, dst)?;
+        if warm_source {
+            lpm_store::v2::linux_copy_file_warm_io(src, dst)?;
+        } else {
+            lpm_store::v2::linux_copy_file_io(src, dst)?;
+        }
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = warm_source;
         std::fs::copy(src, dst)?;
         Ok(())
     }

@@ -11,8 +11,29 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 /// Directories that must be waiting before helper threads start. Most package
 /// trees finish on the calling thread without starting any.
 const HELPER_START_PENDING_DIRS: usize = 16;
-/// Threads reading directories concurrently, including the caller.
-const WALK_THREADS: usize = 4;
+
+static ACTIVE_WALK_HELPERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct HelperSlot;
+
+impl HelperSlot {
+    fn try_acquire(cap: usize) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+
+        ACTIVE_WALK_HELPERS
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < cap).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for HelperSlot {
+    fn drop(&mut self) {
+        ACTIVE_WALK_HELPERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum MetadataReader {
@@ -33,19 +54,27 @@ impl MetadataReader {
     fn read(
         self,
         root: &Path,
+        #[cfg(any(target_os = "linux", target_os = "macos"))] root_fd: Option<
+            std::os::fd::BorrowedFd<'_>,
+        >,
         dir: &Path,
         buffer: &mut [u8],
     ) -> Result<Vec<ObjectTreeEntry>, LpmError> {
         match self {
             #[cfg(target_os = "macos")]
             Self::Bulk => {
-                let mut entries = read_bulk_metadata_entries(dir, buffer)?;
+                let mut entries = read_bulk_metadata_entries_confined(root, root_fd, dir, buffer)?;
                 entries.retain(|entry| !is_object_metadata_sidecar_name(root, dir, &entry.name));
                 Ok(entries)
             }
             Self::Portable => {
                 let _ = buffer;
-                read_object_tree_entries(root, dir)
+                read_object_tree_entries_with_root(
+                    root,
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    root_fd,
+                    dir,
+                )
             }
         }
     }
@@ -93,6 +122,8 @@ struct WalkState {
 
 struct Walk<'a> {
     root: &'a Path,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    root_fd: Option<std::os::fd::OwnedFd>,
     reader: MetadataReader,
     state: Mutex<WalkState>,
     changed: Condvar,
@@ -124,7 +155,13 @@ impl Walk<'_> {
     fn process(&self, dir: PendingDir, buffer: &mut [u8]) -> usize {
         let read = self
             .reader
-            .read(self.root, &dir.path, buffer)
+            .read(
+                self.root,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                self.root_fd.as_ref().map(std::os::fd::AsFd::as_fd),
+                &dir.path,
+                buffer,
+            )
             .map(|entries| {
                 entries
                     .into_iter()
@@ -192,9 +229,22 @@ struct Collected {
     helpers: usize,
 }
 
-fn collect(root: &Path, reader: MetadataReader) -> Collected {
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    allow(clippy::unnecessary_wraps)
+)]
+fn collect(root: &Path, reader: MetadataReader) -> Result<Collected, LpmError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let root_fd = has_persistent_root_fd_headroom()
+        .then(|| open_root_dir_fd(root).ok())
+        .flatten();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let root_identity =
+        dir_identity_before_walk(root, root_fd.as_ref().map(std::os::fd::AsFd::as_fd));
     let walk = Walk {
         root,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        root_fd,
         reader,
         state: Mutex::new(WalkState {
             pending: vec![PendingDir {
@@ -206,12 +256,11 @@ fn collect(root: &Path, reader: MetadataReader) -> Collected {
         }),
         changed: Condvar::new(),
     };
-    static WALK_THREAD_BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let threads = *WALK_THREAD_BUDGET.get_or_init(|| {
-        std::thread::available_parallelism()
-            .map_or(1, std::num::NonZero::get)
-            .min(WALK_THREADS)
-    });
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    run_after_root_open_hook(root);
+    let helper_cap = lpm_common::resources::default_tree_walk_helper_cap(
+        lpm_common::resources::effective_cpu_count(),
+    );
     let mut helpers = 0;
     let mut helpers_requested = false;
     std::thread::scope(|scope| {
@@ -220,11 +269,17 @@ fn collect(root: &Path, reader: MetadataReader) -> Collected {
             let pending = walk.process(dir, &mut buffer);
             if !helpers_requested && pending >= HELPER_START_PENDING_DIRS {
                 helpers_requested = true;
-                for _ in 1..threads {
-                    // A failed spawn leaves the remaining reads on the threads that exist.
+                for _ in 0..helper_cap {
+                    let Some(slot) = HelperSlot::try_acquire(helper_cap) else {
+                        break;
+                    };
+                    // A failed spawn drops `slot` and leaves the remaining reads on active threads.
                     if std::thread::Builder::new()
                         .name("lpm-tree-walk".to_owned())
-                        .spawn_scoped(scope, || walk.work())
+                        .spawn_scoped(scope, || {
+                            let _slot = slot;
+                            walk.work();
+                        })
                         .is_ok()
                     {
                         helpers += 1;
@@ -233,14 +288,16 @@ fn collect(root: &Path, reader: MetadataReader) -> Collected {
             }
         }
     });
-    Collected {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    verify_root_identity_after_walk(root, root_identity)?;
+    Ok(Collected {
         dirs: walk
             .state
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner)
             .dirs,
         helpers,
-    }
+    })
 }
 
 fn hash_collected(
@@ -309,7 +366,7 @@ fn tree_metadata_integrities_with_helpers(
     root: &Path,
     reader: MetadataReader,
 ) -> Result<(TreeMetadataDigests, usize), LpmError> {
-    let Collected { mut dirs, helpers } = collect(root, reader);
+    let Collected { mut dirs, helpers } = collect(root, reader)?;
     let mut hasher = TreeMetadataHasher::new();
     hash_collected(&mut dirs, 0, reader, &mut Vec::new(), &mut hasher)?;
     Ok((hasher.finish(), helpers))
@@ -319,7 +376,7 @@ fn tree_metadata_integrity_with_helpers(
     root: &Path,
     reader: MetadataReader,
 ) -> Result<(String, usize), LpmError> {
-    let Collected { mut dirs, helpers } = collect(root, reader);
+    let Collected { mut dirs, helpers } = collect(root, reader)?;
     let mut hasher = TreeMetadataHasher::strict_only();
     hash_collected(&mut dirs, 0, reader, &mut Vec::new(), &mut hasher)?;
     Ok((hasher.finish_strict(), helpers))
@@ -436,4 +493,96 @@ mod tests {
             tree_metadata_integrity(tree.path(), MetadataReader::Portable).unwrap()
         );
     }
+
+    #[test]
+    fn walk_helper_slot_enforces_global_cap_and_releases_on_drop() {
+        let cap = 2;
+        let baseline = ACTIVE_WALK_HELPERS.load(std::sync::atomic::Ordering::Acquire);
+        let first = HelperSlot::try_acquire(baseline + cap).expect("first slot");
+        let second = HelperSlot::try_acquire(baseline + cap).expect("second slot");
+        assert!(
+            HelperSlot::try_acquire(baseline + cap).is_none(),
+            "helper admission must stop once the process-wide cap is reached"
+        );
+        drop(first);
+        let third = HelperSlot::try_acquire(baseline + cap)
+            .expect("dropping a slot must immediately restore capacity");
+        drop(second);
+        drop(third);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn metadata_walk_rejects_root_directory_swapped_mid_walk() {
+        let parent = tempfile::tempdir().unwrap();
+        let live_root = parent.path().join("pkg");
+        let retired = parent.path().join("pkg-retired");
+        std::fs::create_dir_all(live_root.join("lib")).unwrap();
+        std::fs::write(live_root.join("lib/index.js"), b"original").unwrap();
+
+        let swapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapped_clone = std::sync::Arc::clone(&swapped);
+        let root_for_hook = live_root.clone();
+        let retired_for_hook = retired;
+        let _guard = AfterRootOpenHookGuard::install(move |path| {
+            if path == root_for_hook
+                && !swapped_clone.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                std::fs::rename(&root_for_hook, &retired_for_hook).unwrap();
+                std::fs::create_dir_all(root_for_hook.join("lib")).unwrap();
+                std::fs::write(root_for_hook.join("lib/index.js"), b"tampered").unwrap();
+            }
+        });
+
+        #[cfg(target_os = "macos")]
+        let reader = MetadataReader::Bulk;
+        #[cfg(not(target_os = "macos"))]
+        let reader = MetadataReader::Portable;
+        let result = tree_metadata_integrity(&live_root, reader);
+        assert!(swapped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            result.is_err(),
+            "metadata walk must fail when root directory is swapped for another inode mid-walk"
+        );
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+type RootOpenHookFn = Box<dyn Fn(&Path)>;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+thread_local! {
+    static AFTER_ROOT_OPEN_HOOK: std::cell::RefCell<Option<RootOpenHookFn>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+struct AfterRootOpenHookGuard;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl AfterRootOpenHookGuard {
+    fn install(hook: impl Fn(&Path) + 'static) -> Self {
+        AFTER_ROOT_OPEN_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(hook));
+        });
+        Self
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl Drop for AfterRootOpenHookGuard {
+    fn drop(&mut self) {
+        AFTER_ROOT_OPEN_HOOK.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn run_after_root_open_hook(root: &Path) {
+    AFTER_ROOT_OPEN_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow().as_ref() {
+            hook(root);
+        }
+    });
 }

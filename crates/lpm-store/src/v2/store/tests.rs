@@ -562,6 +562,109 @@ fn linux_warm_materialization_uses_lower_4kib_reflink_threshold_and_parses_overl
         ),
         Some(PathBuf::from("/var/lib/btrfs-upper"))
     );
+
+    let escaped_mountinfo = b"54 29 0:45 / /var/lib/my\\040app rw,relatime - overlay overlay rw,lowerdir=/lower,upperdir=/var/lib/btrfs\\040upper,workdir=/work\n";
+    assert_eq!(
+        super::linux_overlay_upperdir_from_mountinfo(
+            Path::new("/var/lib/my app/store/links"),
+            escaped_mountinfo
+        ),
+        Some(PathBuf::from("/var/lib/btrfs upper"))
+    );
+
+    let docker_btrfs_mountinfo = concat!(
+        "100 99 0:45 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A,upperdir=/var/lib/docker/overlay2/abc/diff,workdir=/var/lib/docker/overlay2/abc/work\n",
+        "101 100 0:30 / /var/lib/docker/overlay2 rw,relatime - btrfs /dev/nvme0n1p2 rw,space_cache=v2\n",
+    );
+    assert_eq!(
+        super::linux_overlay_upperdir_is_btrfs_from_mountinfo(
+            Path::new("/workspace/project"),
+            docker_btrfs_mountinfo.as_bytes()
+        ),
+        Some(true)
+    );
+
+    let docker_ext4_mountinfo = concat!(
+        "100 99 0:45 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A,upperdir=/var/lib/docker/overlay2/abc/diff,workdir=/var/lib/docker/overlay2/abc/work\n",
+        "101 100 8:1 / /var/lib/docker/overlay2 rw,relatime - ext4 /dev/sda1 rw\n",
+    );
+    assert_eq!(
+        super::linux_overlay_upperdir_is_btrfs_from_mountinfo(
+            Path::new("/workspace/project"),
+            docker_ext4_mountinfo.as_bytes()
+        ),
+        Some(false)
+    );
+
+    let docker_bind_btrfs_mountinfo = concat!(
+        "100 99 0:45 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A,upperdir=/var/lib/docker/overlay2/abc/diff,workdir=/var/lib/docker/overlay2/abc/work\n",
+        "101 100 0:30 /var/lib/docker/containers/abc/resolv.conf /etc/resolv.conf rw,relatime - btrfs /dev/nvme0n1p2 rw,space_cache=v2\n",
+    );
+    assert_eq!(
+        super::linux_overlay_upperdir_is_btrfs_from_mountinfo(
+            Path::new("/workspace/project"),
+            docker_bind_btrfs_mountinfo.as_bytes()
+        ),
+        Some(true)
+    );
+
+    let podman_bind_btrfs_mountinfo = concat!(
+        "100 99 0:45 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/containers/storage/overlay/l/A,upperdir=/var/lib/containers/storage/overlay/abc/diff,workdir=/var/lib/containers/storage/overlay/abc/work\n",
+        "101 100 0:30 /var/lib/containers/storage/overlay-containers/abc/userdata/resolv.conf /etc/resolv.conf rw,relatime - btrfs /dev/nvme0n1p2 rw,space_cache=v2\n",
+    );
+    assert_eq!(
+        super::linux_overlay_upperdir_is_btrfs_from_mountinfo(
+            Path::new("/workspace/project"),
+            podman_bind_btrfs_mountinfo.as_bytes()
+        ),
+        Some(true)
+    );
+
+    let unrelated_var_lib_mountinfo = concat!(
+        "100 99 0:45 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A,upperdir=/var/lib/docker/overlay2/abc/diff,workdir=/var/lib/docker/overlay2/abc/work\n",
+        "101 100 0:30 /var/lib/other/containers/abc/resolv.conf /etc/resolv.conf rw,relatime - btrfs /dev/nvme0n1p2 rw,space_cache=v2\n",
+    );
+    assert_eq!(
+        super::linux_overlay_upperdir_is_btrfs_from_mountinfo(
+            Path::new("/workspace/project"),
+            unrelated_var_lib_mountinfo.as_bytes()
+        ),
+        None
+    );
+}
+
+#[test]
+fn parallel_single_directory_materialization_matches_tree_metadata_integrity() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src-large");
+    let dst = dir.path().join("dst-large");
+    std::fs::create_dir_all(src.join("nested")).unwrap();
+    for idx in 0..80 {
+        std::fs::write(
+            src.join(format!("icon-{idx:03}.js")),
+            format!("export const id = {idx};\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(src.join("nested/leaf.js"), b"export const leaf = true;\n").unwrap();
+    let digests =
+        crate::v2::fs_util::materialize_into_with_integrity(&src, &dst, false, true, true).unwrap();
+    if let Some(digests) = digests {
+        assert_eq!(
+            digests.metadata,
+            compute_tree_metadata_integrity(&dst).unwrap()
+        );
+    }
+    for idx in 0..80 {
+        assert_eq!(
+            std::fs::read_to_string(dst.join(format!("icon-{idx:03}.js"))).unwrap(),
+            format!("export const id = {idx};\n")
+        );
+    }
+    assert_eq!(
+        std::fs::read(dst.join("nested/leaf.js")).unwrap(),
+        b"export const leaf = true;\n"
+    );
 }
 
 #[test]
@@ -3103,7 +3206,7 @@ fn v3_registry_ingest_uses_last_duplicate_tar_member() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert!(
-        blob_contents
+        !blob_contents
             .iter()
             .any(|content| content == b"module.exports = 'first';\n")
     );
@@ -3600,6 +3703,71 @@ fn v3_prune_streaming_inventories_preserve_totals_and_sorted_orphans() {
     ] {
         assert!(paths.windows(2).all(|pair| pair[0] <= pair[1]));
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn v3_unicode_aliasing_tarball_cannot_poison_concurrent_package_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe_a = dir.path().join("probe_caf\u{00e9}");
+    let probe_b = dir.path().join("probe_cafe\u{0301}");
+    std::fs::write(&probe_a, b"1").unwrap();
+    let aliases_unicode = std::fs::symlink_metadata(&probe_b).is_ok();
+    let _ = std::fs::remove_file(&probe_a);
+    if !aliases_unicode {
+        return;
+    }
+
+    let store = std::sync::Arc::new(Store::at_v3(dir.path()));
+    let genuine = b"module.exports = 'genuine-victim-payload';";
+    let evil = b"module.exports = 'evil-attacker-payload!';";
+    assert_eq!(genuine.len(), evil.len());
+
+    let mut attacker_entries: Vec<(String, Vec<u8>)> = vec![
+        (
+            "package.json".to_string(),
+            br#"{"name":"attacker","version":"1.0.0"}"#.to_vec(),
+        ),
+        ("caf\u{00e9}.js".to_string(), genuine.to_vec()),
+    ];
+    for idx in 0..256 {
+        attacker_entries.push((format!("pad/{idx}.txt"), format!("p{idx}").into_bytes()));
+    }
+    attacker_entries.push(("cafe\u{0301}.js".to_string(), evil.to_vec()));
+    let attacker_refs: Vec<(&str, &[u8])> = attacker_entries
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+    let attacker_tarball = build_test_tarball(&attacker_refs);
+
+    let victim_tarball = build_test_tarball(&[
+        ("package.json", br#"{"name":"victim","version":"1.0.0"}"#),
+        ("index.js", genuine),
+    ]);
+
+    let store_a = std::sync::Arc::clone(&store);
+    let store_v = std::sync::Arc::clone(&store);
+    let attacker_handle =
+        std::thread::spawn(move || store_a.extract_object_from_bytes(&attacker_tarball, None));
+    let victim_handle =
+        std::thread::spawn(move || store_v.extract_object_from_bytes(&victim_tarball, None));
+
+    assert!(
+        attacker_handle.join().unwrap().is_err(),
+        "unicode-aliasing attacker tarball must fail extraction"
+    );
+    let (victim_dir, _, _) = victim_handle.join().unwrap().unwrap();
+    assert_eq!(
+        std::fs::read(victim_dir.join("index.js")).unwrap(),
+        genuine,
+        "victim package must always retain genuine bytes"
+    );
+    let verification = store.verify_file_cas(true).unwrap().unwrap();
+    assert!(
+        verification.issues.is_empty(),
+        "deep v3 CAS verification must report no corrupted blobs: {:?}",
+        verification.issues
+    );
 }
 
 #[test]
@@ -6292,7 +6460,7 @@ fn opened_regular_files_stream_only_above_the_hybrid_buffer_limit() {
     ] {
         reader.get_ref().set_len(size).unwrap();
         assert_eq!(
-            file_exceeds_hybrid_buffer(&reader),
+            file_takes_pipelined_decoder(&reader),
             size > lpm_extractor::MAX_HYBRID_BUFFERED_COMPRESSED_SIZE
         );
     }
@@ -6316,10 +6484,6 @@ fn small_files_that_decode_past_the_buffer_take_the_pipelined_decoder() {
             file_takes_pipelined_decoder(&reader),
             pipelined,
             "{decoded}"
-        );
-        assert!(
-            !file_exceeds_hybrid_buffer(&reader),
-            "inspecting extraction keeps buffering what it can't pipeline"
         );
         let mut cursor = reader.get_ref();
         assert_eq!(
@@ -6351,7 +6515,7 @@ fn nonregular_file_handles_retain_the_hybrid_reader() {
     let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
     let fd: std::os::fd::OwnedFd = socket.into();
     let reader = std::io::BufReader::new(std::fs::File::from(fd));
-    assert!(!file_exceeds_hybrid_buffer(&reader));
+    assert!(!file_takes_pipelined_decoder(&reader));
 }
 
 fn large_uncompressed_tarball() -> Vec<u8> {

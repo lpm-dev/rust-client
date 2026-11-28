@@ -724,8 +724,14 @@ fn decompress_gzip_libdeflate_with_limits_and_budget<'a>(
     };
 
     // Keep input and output reserved together until decoding succeeds. An owned
-    // input can then be dropped and its share released before tar walking.
-    let mut budget = extract_budget.acquire(capacity.saturating_add(compressed.len()) as u64);
+    // input can then be dropped and its share released before tar walking. If
+    // the required reservation exceeds the container budget, fall back to
+    // streaming before attempting the oversized allocation.
+    let Some(mut budget) =
+        extract_budget.try_acquire(capacity.saturating_add(compressed.len()) as u64)
+    else {
+        return Ok(BufferedGzipDecode::NeedsStreaming);
+    };
     let mut decompressor = libdeflater::Decompressor::new();
     loop {
         let mut output = system_buffer::SystemBuffer::zeroed(capacity);
@@ -748,7 +754,12 @@ fn decompress_gzip_libdeflate_with_limits_and_budget<'a>(
                 drop(output);
                 capacity = capacity.saturating_mul(2).min(max_buffered);
                 drop(budget);
-                budget = extract_budget.acquire(capacity.saturating_add(compressed.len()) as u64);
+                let Some(grown_budget) =
+                    extract_budget.try_acquire(capacity.saturating_add(compressed.len()) as u64)
+                else {
+                    return Ok(BufferedGzipDecode::NeedsStreaming);
+                };
+                budget = grown_budget;
             }
             Err(e) => {
                 return Err(LpmError::Registry(format!(
@@ -776,29 +787,61 @@ const MAX_EXTRACTION_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 /// run in parallel and an arbitrary number of small ones; legitimate
 /// npm packages decompress well below the per-call cap and rarely
 /// hold a slot for more than a few ms.
+#[cfg(test)]
 const PARALLEL_EXTRACT_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Counting semaphore over bytes retained by buffered gzip decoding.
 /// The reservation remains held until the decoded buffer is dropped.
-static EXTRACT_BUDGET: std::sync::LazyLock<AllocBudget> =
-    std::sync::LazyLock::new(|| AllocBudget {
-        available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
-        cv: std::sync::Condvar::new(),
-    });
+static EXTRACT_BUDGET: std::sync::LazyLock<AllocBudget> = std::sync::LazyLock::new(|| {
+    let budget_bytes = lpm_common::resources::extract_memory_budget_bytes(
+        lpm_common::resources::effective_memory_limit_bytes(),
+    );
+    AllocBudget::new(budget_bytes)
+});
 
 struct AllocBudget {
+    budget_bytes: u64,
     available: std::sync::Mutex<u64>,
     cv: std::sync::Condvar,
 }
 
 impl AllocBudget {
+    fn new(budget_bytes: u64) -> Self {
+        let budget_bytes = budget_bytes.max(1);
+        Self {
+            budget_bytes,
+            available: std::sync::Mutex::new(budget_bytes),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Reserve `bytes` within the configured budget, waiting until enough
+    /// headroom is free. Returns `None` without waiting or reserving when a
+    /// single request exceeds the total budget so callers can route oversized
+    /// payloads to streaming instead of exceeding container memory limits.
+    fn try_acquire(&self, bytes: u64) -> Option<AllocBudgetGuard<'_>> {
+        if bytes > self.budget_bytes {
+            return None;
+        }
+        let mut guard = self.lock_available();
+        while *guard < bytes {
+            guard = self.wait_available(guard);
+        }
+        *guard -= bytes;
+        Some(AllocBudgetGuard {
+            budget: self,
+            bytes,
+        })
+    }
+
+    #[cfg(test)]
     fn acquire(&self, bytes: u64) -> AllocBudgetGuard<'_> {
         // Reservations larger than the whole budget would deadlock
         // (no path to make `available >= bytes` true). Cap at the
         // budget itself — the in-flight call still gets serialized
         // exclusivity, which is the right behavior for an outsized
         // legitimate tarball.
-        let request = bytes.min(PARALLEL_EXTRACT_BUDGET_BYTES);
+        let request = bytes.min(self.budget_bytes);
         let mut guard = self.lock_available();
         while *guard < request {
             guard = self.wait_available(guard);
@@ -843,7 +886,7 @@ impl AllocBudgetGuard<'_> {
         let mut available = self.budget.lock_available();
         *available = available
             .saturating_add(released)
-            .min(PARALLEL_EXTRACT_BUDGET_BYTES);
+            .min(self.budget.budget_bytes);
         self.bytes = retained;
         self.budget.cv.notify_all();
     }
@@ -854,7 +897,7 @@ impl Drop for AllocBudgetGuard<'_> {
         let mut guard = self.budget.lock_available();
         *guard = guard
             .saturating_add(self.bytes)
-            .min(PARALLEL_EXTRACT_BUDGET_BYTES);
+            .min(self.budget.budget_bytes);
         // `notify_all`, not `notify_one`: a single release can
         // unblock multiple waiters with different reservation
         // sizes simultaneously (e.g. releasing 256 MiB can satisfy
@@ -920,14 +963,29 @@ enum InspectionMode {
     WithoutCallback,
 }
 
+/// Handle-bound regular-file identity and timestamp stamp captured when an
+/// extracted file is accepted on disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtractedFileStamp {
+    pub identity: lpm_common::FileIdentity,
+    pub size: u64,
+    pub mode: u32,
+    pub mtime_ns: u64,
+    pub ctime_ns: u64,
+}
+
 /// A successfully extracted regular file and the BLAKE3 digest computed
 /// during its write pass.
 #[derive(Debug, Eq, PartialEq)]
 pub struct ExtractedFileDigest {
     /// Path relative to the extraction root.
     pub relative_path: PathBuf,
+    /// Final byte length written for this archive entry.
+    pub size: u64,
     /// BLAKE3 digest of the final bytes written for this archive entry.
     pub blake3_digest: [u8; 32],
+    /// Handle-bound file stamp captured at extraction acceptance, when available.
+    pub source_stamp: Option<ExtractedFileStamp>,
 }
 
 trait ExtractionRecord: Sized {
@@ -935,7 +993,9 @@ trait ExtractionRecord: Sized {
 
     fn from_extracted_file(
         relative_path: PathBuf,
+        size: u64,
         blake3_digest: Option<[u8; 32]>,
+        source_stamp: Option<ExtractedFileStamp>,
     ) -> Result<Self, LpmError>;
 
     fn relative_path(&self) -> &Path;
@@ -946,7 +1006,9 @@ impl ExtractionRecord for PathBuf {
 
     fn from_extracted_file(
         relative_path: PathBuf,
+        _size: u64,
         _blake3_digest: Option<[u8; 32]>,
+        _source_stamp: Option<ExtractedFileStamp>,
     ) -> Result<Self, LpmError> {
         Ok(relative_path)
     }
@@ -961,7 +1023,9 @@ impl ExtractionRecord for ExtractedFileDigest {
 
     fn from_extracted_file(
         relative_path: PathBuf,
+        size: u64,
         blake3_digest: Option<[u8; 32]>,
+        source_stamp: Option<ExtractedFileStamp>,
     ) -> Result<Self, LpmError> {
         let blake3_digest = blake3_digest.ok_or_else(|| {
             LpmError::Registry(format!(
@@ -971,7 +1035,9 @@ impl ExtractionRecord for ExtractedFileDigest {
         })?;
         Ok(Self {
             relative_path,
+            size,
             blake3_digest,
+            source_stamp,
         })
     }
 
@@ -1197,6 +1263,29 @@ pub fn extract_tarball_from_reader_pipelined_digests(
     cancel_input: impl FnOnce(),
 ) -> Result<Vec<ExtractedFileDigest>, LpmError> {
     pipeline::extract(reader, target_dir, DEFAULT_EXTRACTION_LIMITS, cancel_input)
+}
+
+/// Decode gzip ahead of file extraction while still running an ordered
+/// per-entry inspector callback on the consuming thread.
+pub fn extract_tarball_from_reader_pipelined_with_entry_digests<P, I>(
+    reader: impl Read + Send,
+    target_dir: &Path,
+    buffer_predicate: P,
+    inspector: I,
+    cancel_input: impl FnOnce(),
+) -> Result<Vec<ExtractedFileDigest>, LpmError>
+where
+    P: Fn(&Path, u64) -> bool,
+    I: for<'a> FnMut(EntryInfo<'a>),
+{
+    pipeline::extract_with_inspector(
+        reader,
+        target_dir,
+        DEFAULT_EXTRACTION_LIMITS,
+        buffer_predicate,
+        inspector,
+        cancel_input,
+    )
 }
 
 /// Extract an uncompressed tar stream, reading it on a separate thread so the
@@ -1774,8 +1863,7 @@ where
             )));
         }
 
-        let original_path = entry.path().to_path_buf();
-        let Some(relative_path) = sanitize_entry_path(&original_path)? else {
+        let Some(relative_path) = sanitize_entry_path(entry.path())? else {
             return Ok(ControlFlow::<()>::Continue(()));
         };
 
@@ -1826,6 +1914,7 @@ where
                         relative_path,
                         writers::Written {
                             output: file.complete()?,
+                            size,
                             digest,
                         },
                     );
@@ -1843,15 +1932,17 @@ where
                         &mut extracted_files,
                         &mut accepted_identities,
                     )?;
-                    let mut bytes = vec![0; length];
-                    pending.make_room(
-                        pool,
-                        bytes.capacity(),
-                        &mut extracted_files,
-                        &mut accepted_identities,
-                    )?;
+                    let mut bytes = vec![0u8; length];
                     entry.read_exact(&mut bytes)?;
                     let capacity = bytes.capacity();
+                    if capacity > length {
+                        pending.make_room(
+                            pool,
+                            capacity,
+                            &mut extracted_files,
+                            &mut accepted_identities,
+                        )?;
+                    }
                     pool.submit(writers::Job {
                         sequence: pending.next_sequence(),
                         target: output.new_file(&relative_path)?,
@@ -1891,26 +1982,23 @@ where
                 compute_blake3,
             )?;
 
-            let extracted_file = E::from_extracted_file(relative_path, blake3_digest)?;
-            let accepted_identity = match inspection_mode {
+            let (accepted_identity, source_stamp) = match inspection_mode {
                 InspectionMode::WithCallback => {
                     output.validate_parent_for_inspection()?;
                     pending.validate()?;
-                    pending.commit();
+                    let (_, stamp) = pending.commit_with_stamp()?;
                     inspector(EntryInfo {
-                        relative_path: extracted_file.relative_path(),
+                        relative_path: &relative_path,
                         size,
                         bytes: buffered_bytes.as_deref(),
                         blake3_digest,
                     });
-                    output.accepted_file_identity(extracted_file.relative_path())?
+                    (output.accepted_file_identity(&relative_path)?, stamp)
                 }
-                InspectionMode::WithoutCallback => {
-                    let identity = pending.identity()?;
-                    pending.commit();
-                    identity
-                }
+                InspectionMode::WithoutCallback => pending.commit_with_stamp()?,
             };
+            let extracted_file =
+                E::from_extracted_file(relative_path, size, blake3_digest, source_stamp)?;
 
             match path_match {
                 ArchivePathMatch::New { folded_hash } => {
@@ -1944,8 +2032,8 @@ where
         ArchiveEnd::EndOfInput => visit_tar_archive_to_end(reader, tar_limits, visitor),
     };
 
-    let writers_result = if let Some((pool, mut pending)) = parallel {
-        let drained = pending.drain(&pool, &mut extracted_files, &mut accepted_identities);
+    let writers_result = if let Some((mut pool, mut pending)) = parallel {
+        let drained = pending.drain(&mut pool, &mut extracted_files, &mut accepted_identities);
         let joined = pool.finish();
         drained.and(joined)
     } else {
@@ -2185,6 +2273,13 @@ pub fn sanitize_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
                     path.display()
                 )));
             }
+            #[cfg(windows)]
+            Component::Normal(name) if has_windows_invalid_filename_chars(name) => {
+                return Err(LpmError::Registry(format!(
+                    "invalid Windows filename characters in tarball entry: {}",
+                    path.display()
+                )));
+            }
             Component::Normal(_) | Component::CurDir => {}
         }
     }
@@ -2405,20 +2500,48 @@ fn append_case_fold_component_key(key: &mut String, component: &OsStr) {
 fn is_windows_reserved_device_name(component: &OsStr) -> bool {
     let component = component.to_string_lossy();
     let trimmed = component.trim_end_matches([' ', '.']);
-    let stem = trimmed.split('.').next().unwrap_or(trimmed);
-    let upper = stem.to_ascii_uppercase();
-
-    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
-        || is_reserved_windows_port_name(&upper, "COM")
-        || is_reserved_windows_port_name(&upper, "LPT")
+    let stem = trimmed
+        .split(['.', ':'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches(' ');
+    if stem.eq_ignore_ascii_case("CON")
+        || stem.eq_ignore_ascii_case("PRN")
+        || stem.eq_ignore_ascii_case("AUX")
+        || stem.eq_ignore_ascii_case("NUL")
+        || stem.eq_ignore_ascii_case("CLOCK$")
+        || stem.eq_ignore_ascii_case("CONIN$")
+        || stem.eq_ignore_ascii_case("CONOUT$")
+    {
+        return true;
+    }
+    if let Some(prefix) = stem.as_bytes().get(..3)
+        && (prefix.eq_ignore_ascii_case(b"COM") || prefix.eq_ignore_ascii_case(b"LPT"))
+    {
+        return matches!(
+            &stem[3..],
+            "1" | "2"
+                | "3"
+                | "4"
+                | "5"
+                | "6"
+                | "7"
+                | "8"
+                | "9"
+                | "\u{00B9}"
+                | "\u{00B2}"
+                | "\u{00B3}"
+        );
+    }
+    false
 }
 
-fn is_reserved_windows_port_name(upper: &str, prefix: &str) -> bool {
-    let Some(number) = upper.strip_prefix(prefix) else {
-        return false;
-    };
-
-    matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+#[cfg(any(windows, test))]
+fn has_windows_invalid_filename_chars(component: &OsStr) -> bool {
+    component
+        .to_string_lossy()
+        .chars()
+        .any(|ch| matches!(ch, ':' | '<' | '>' | '"' | '|' | '?' | '*') || (ch as u32) < 0x20)
 }
 
 #[cfg(test)]
@@ -2646,10 +2769,7 @@ mod tests {
     fn owned_buffered_input_releases_its_reservation_before_tar_walking() {
         let tgz = create_test_tarball("payload.bin", b"contents");
         let output_size = decompress_gzip_libdeflate(&tgz).unwrap().len() as u64;
-        let budget = AllocBudget {
-            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
-            cv: std::sync::Condvar::new(),
-        };
+        let budget = AllocBudget::new(PARALLEL_EXTRACT_BUDGET_BYTES);
         let dir = tempfile::tempdir().unwrap();
         let mut inspected = false;
         let files: Vec<PathBuf> = extract_buffered_gzip_tarball(
@@ -2678,10 +2798,7 @@ mod tests {
     fn borrowed_buffered_input_keeps_its_reservation_during_tar_walking() {
         let tgz = create_test_tarball("payload.bin", b"contents");
         let output_size = decompress_gzip_libdeflate(&tgz).unwrap().len() as u64;
-        let budget = AllocBudget {
-            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
-            cv: std::sync::Condvar::new(),
-        };
+        let budget = AllocBudget::new(PARALLEL_EXTRACT_BUDGET_BYTES);
         let dir = tempfile::tempdir().unwrap();
         let mut inspected = false;
         let _: Vec<PathBuf> = extract_buffered_gzip_tarball(
@@ -2707,10 +2824,7 @@ mod tests {
 
     #[test]
     fn shrinking_allocation_reservation_preserves_ownership_until_drop() {
-        let budget = AllocBudget {
-            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
-            cv: std::sync::Condvar::new(),
-        };
+        let budget = AllocBudget::new(PARALLEL_EXTRACT_BUDGET_BYTES);
         let mut reservation = budget.acquire(100);
         reservation.shrink_to(40);
         assert_eq!(*budget.lock_available(), PARALLEL_EXTRACT_BUDGET_BYTES - 40);
@@ -4540,10 +4654,7 @@ mod tests {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&original).unwrap();
         let compressed = encoder.finish().unwrap();
-        let budget = AllocBudget {
-            available: std::sync::Mutex::new(BUDGET_BYTES),
-            cv: std::sync::Condvar::new(),
-        };
+        let budget = AllocBudget::new(BUDGET_BYTES);
         let limits = ExtractionLimits {
             max_buffered_compressed_size: 64 * 1024,
             max_buffered_decompressed_size: 64 * 1024,
@@ -4572,10 +4683,7 @@ mod tests {
     /// parallel-running suites.
     #[test]
     fn alloc_budget_serializes_when_request_would_exceed_ceiling() {
-        let budget = AllocBudget {
-            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
-            cv: std::sync::Condvar::new(),
-        };
+        let budget = AllocBudget::new(PARALLEL_EXTRACT_BUDGET_BYTES);
         let huge = PARALLEL_EXTRACT_BUDGET_BYTES;
         let g1 = budget.acquire(huge);
         assert_eq!(*budget.available.lock().unwrap(), 0);
@@ -4609,10 +4717,7 @@ mod tests {
     /// reservation.
     #[test]
     fn alloc_budget_caps_oversized_request_to_full_budget() {
-        let budget = AllocBudget {
-            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
-            cv: std::sync::Condvar::new(),
-        };
+        let budget = AllocBudget::new(PARALLEL_EXTRACT_BUDGET_BYTES);
         let _g = budget.acquire(PARALLEL_EXTRACT_BUDGET_BYTES * 4);
         // The acquire returned (didn't deadlock) and consumed the
         // whole budget rather than the impossible 4× request.
@@ -4621,10 +4726,7 @@ mod tests {
 
     #[test]
     fn alloc_budget_acquire_recovers_from_poisoned_mutex() {
-        let budget = AllocBudget {
-            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
-            cv: std::sync::Condvar::new(),
-        };
+        let budget = AllocBudget::new(PARALLEL_EXTRACT_BUDGET_BYTES);
 
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = budget.available.lock().unwrap();
@@ -4638,5 +4740,190 @@ mod tests {
             Err(poisoned) => *poisoned.into_inner(),
         };
         assert_eq!(available, PARALLEL_EXTRACT_BUDGET_BYTES - 1);
+    }
+
+    #[test]
+    fn dynamic_container_alloc_budget_caps_and_serializes_at_configured_limit() {
+        let container_budget = 128 * 1024 * 1024;
+        let budget = AllocBudget::new(container_budget);
+        let guard = budget.acquire(container_budget * 2);
+        assert_eq!(*budget.lock_available(), 0);
+        drop(guard);
+        assert_eq!(*budget.lock_available(), container_budget);
+    }
+
+    #[test]
+    fn buffered_decode_routes_to_streaming_when_initial_or_growth_exceeds_container_budget() {
+        use std::io::Write as _;
+
+        // Payload decompresses to 48 KiB (ISIZE = 48 KiB), exceeding the 16 KiB container budget.
+        let original = vec![b'a'; 48 * 1024];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let tiny_budget = AllocBudget::new(16 * 1024);
+        let limits = ExtractionLimits {
+            max_buffered_compressed_size: 256 * 1024,
+            max_buffered_decompressed_size: 256 * 1024,
+            max_extraction_size: 256 * 1024,
+            max_file_size: 256 * 1024,
+            max_file_count: 16,
+            max_path_ledger_bytes: MAX_PATH_LEDGER_BYTES,
+        };
+        let outcome =
+            decompress_gzip_libdeflate_with_limits_and_budget(&compressed, limits, &tiny_budget)
+                .unwrap();
+        assert!(
+            matches!(outcome, BufferedGzipDecode::NeedsStreaming),
+            "initial decode exceeding container budget must route to streaming"
+        );
+        assert_eq!(*tiny_budget.lock_available(), 16 * 1024);
+
+        // Growth path: forge a small ISIZE (4 KiB, fits within 16 KiB budget) on a
+        // 48 KiB multi-member/concatenated payload (or truncated hint via 4 GiB wrap);
+        // Wait: libdeflate validates ISIZE against decompressed length, so instead test
+        // a small 8 KiB compressed + 12 KiB decoded payload under a 16 KiB budget where
+        // compressed.len() + capacity > budget_bytes.
+        let mut noisy = Vec::with_capacity(12 * 1024);
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        for _ in 0..(12 * 1024) {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            noisy.push((state >> 56) as u8);
+        }
+        let mut enc2 = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+        enc2.write_all(&noisy).unwrap();
+        let noisy_gz = enc2.finish().unwrap();
+        assert!(noisy_gz.len() + noisy.len() > 16 * 1024);
+        let outcome2 =
+            decompress_gzip_libdeflate_with_limits_and_budget(&noisy_gz, limits, &tiny_budget)
+                .unwrap();
+        assert!(
+            matches!(outcome2, BufferedGzipDecode::NeedsStreaming),
+            "compressed+decompressed size exceeding container budget must route to streaming"
+        );
+
+        // Growth path: two concatenated gzip members where the trailing ISIZE
+        // is only 4 KiB (admitted initially), while total decoded output is 24 KiB (> 16 KiB).
+        let mut enc_part1 =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc_part1.write_all(&vec![b'p'; 20 * 1024]).unwrap();
+        let mut concat_gz = enc_part1.finish().unwrap();
+        let mut enc_part2 =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc_part2.write_all(&vec![b'q'; 4 * 1024]).unwrap();
+        concat_gz.extend_from_slice(&enc_part2.finish().unwrap());
+        let outcome3 =
+            decompress_gzip_libdeflate_with_limits_and_budget(&concat_gz, limits, &tiny_budget)
+                .unwrap();
+        assert!(
+            matches!(outcome3, BufferedGzipDecode::NeedsStreaming),
+            "growth exceeding container budget must route to streaming without oversized allocation"
+        );
+        assert_eq!(*tiny_budget.lock_available(), 16 * 1024);
+    }
+
+    #[test]
+    fn windows_reserved_device_name_classification_covers_ports_and_case() {
+        for reserved in [
+            "CON",
+            "con",
+            "Con.txt",
+            "prn ",
+            "aux.",
+            "NUL.js",
+            "NUL .txt",
+            "NUL:",
+            "COM1:",
+            "CON:x",
+            "CLOCK$",
+            "clock$.bin",
+            "CONIN$",
+            "conout$.js",
+            "COM1",
+            "com9.ts",
+            "COM\u{00B9}",
+            "com\u{00B2}.txt",
+            "LPT1",
+            "lpt5.json",
+            "LPT\u{00B3}.json",
+        ] {
+            assert!(
+                is_windows_reserved_device_name(OsStr::new(reserved)),
+                "expected reserved: {reserved}"
+            );
+        }
+        for allowed in [
+            "COM0", "COM10", "LPT0", "LPT10", "CONSOL", "CLOCK", "CLOCK$1", "index.js", "nu",
+        ] {
+            assert!(
+                !is_windows_reserved_device_name(OsStr::new(allowed)),
+                "expected allowed: {allowed}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_invalid_filename_chars_rejects_ads_wildcards_and_controls() {
+        for invalid in [
+            "a.js:stream",
+            "sub::$INDEX_ALLOCATION",
+            "a<b.js",
+            "a>b.js",
+            "a\"b.js",
+            "a|b.js",
+            "a?b.js",
+            "a*b.js",
+            "ctrl\x01name.js",
+            "tab\tname.js",
+        ] {
+            assert!(
+                has_windows_invalid_filename_chars(OsStr::new(invalid)),
+                "expected invalid Windows filename: {invalid:?}"
+            );
+        }
+        for allowed in [
+            "index.js",
+            "file-name_1.2.3.mjs",
+            "caf\u{00e9}.ts",
+            "CLOCK$",
+        ] {
+            assert!(
+                !has_windows_invalid_filename_chars(OsStr::new(allowed)),
+                "expected allowed Windows filename: {allowed:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn extract_tarball_rejects_unicode_aliasing_entries_without_overwriting_earlier_file() {
+        let archive = create_test_tarball_with_entries(&[
+            ("package.json", br#"{"name":"alias-pkg","version":"1.0.0"}"#),
+            ("caf\u{00e9}.js", b"genuine-bytes"),
+            ("cafe\u{0301}.js", b"attacker-byte"),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let result = extract_tarball(&archive, root.path());
+        assert!(
+            result.is_err(),
+            "NFC/NFD aliasing entries on APFS must fail extraction instead of overwriting"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn extract_tarball_rejects_unicode_aliasing_directories_with_distinct_leaf_names() {
+        let archive = create_test_tarball_with_entries(&[
+            ("package.json", br#"{"name":"dir-alias","version":"1.0.0"}"#),
+            ("caf\u{00e9}/a.js", b"first"),
+            ("cafe\u{0301}/b.js", b"second"),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let result = extract_tarball(&archive, root.path());
+        assert!(
+            result.is_err(),
+            "NFC/NFD aliasing directories on APFS must fail extraction"
+        );
     }
 }

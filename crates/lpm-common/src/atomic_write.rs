@@ -745,7 +745,7 @@ fn rename_capability_handle(
     let name = destination.encode_wide().collect::<Vec<_>>();
     let mut relative = RenameRecord::new(directory.as_raw_handle(), &name)?;
     let mut attempt = 0;
-    for delay_ms in [0, 50, 150, 450, 1_350, 4_050] {
+    for delay_ms in [0, 5, 15, 50, 150, 450, 1_350, 4_050] {
         if delay_ms != 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
@@ -897,12 +897,11 @@ impl RenameRecord {
     /// `replace` is set, and returns the NTSTATUS.
     fn apply(
         &mut self,
-        file: &cap_std::fs::File,
+        file: &impl std::os::windows::io::AsRawHandle,
         class: RenameClass,
         replace: bool,
         target: RenameTarget,
     ) -> windows_sys::Win32::Foundation::NTSTATUS {
-        use std::os::windows::io::AsRawHandle as _;
         use windows_sys::Wdk::Storage::FileSystem::{
             FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
             FileRenameInformation, FileRenameInformationEx, NtSetInformationFile,
@@ -1175,12 +1174,17 @@ fn open_temporary(path: &Path, exact_mode: Option<u32>, owner_only: bool) -> io:
         options.mode(exact_mode.unwrap_or(0o666));
     }
     #[cfg(windows)]
-    if owner_only {
+    {
         use std::os::windows::fs::OpenOptionsExt as _;
         use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
         use windows_sys::Win32::Storage::FileSystem::{DELETE, READ_CONTROL, WRITE_DAC};
 
-        options.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC);
+        let security = if owner_only {
+            READ_CONTROL | WRITE_DAC
+        } else {
+            0
+        };
+        options.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | security);
     }
     #[cfg(not(windows))]
     let _ = owner_only;
@@ -1287,11 +1291,91 @@ impl CreatedTemporary {
     }
 
     fn commit(&mut self, destination: &Path, write_through: bool) -> io::Result<()> {
+        #[cfg(windows)]
+        if !write_through
+            && let Some(file) = self.file.as_ref()
+            && try_rename_open_std_file_replacing(file, destination)?
+        {
+            drop(self.file.take());
+            self.cleanup = false;
+            return Ok(());
+        }
         drop(self.file.take());
         replace_file(&self.path, destination, write_through)?;
         self.cleanup = false;
         Ok(())
     }
+}
+
+/// Attempt to atomically rename an open temporary `File` (opened with `DELETE`
+/// access) to `destination` before closing it, avoiding the close-then-scan
+/// sharing-violation window from Windows Defender before `MoveFileExW`.
+/// Returns `Ok(true)` if renamed, `Ok(false)` to fall back to `MoveFileExW`.
+#[cfg(windows)]
+fn try_rename_open_std_file_replacing(file: &File, destination: &Path) -> io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, RtlNtStatusToDosError,
+        STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED,
+    };
+
+    let extended = crate::absolute_extended_path(destination)?;
+    let wide: Vec<u16> = extended.as_os_str().encode_wide().collect();
+    let nt_path = verbatim_to_nt_path(&wide)?;
+    let mut record = RenameRecord::new(std::ptr::null_mut(), &nt_path)?;
+    let mut class = RenameClass::Posix;
+    for delay_ms in [0, 5, 15, 50, 150, 450, 1_350, 4_050] {
+        if delay_ms != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        let status = loop {
+            let status = record.apply(file, class, true, RenameTarget::FullPath);
+            if class == RenameClass::Posix
+                && matches!(
+                    status,
+                    STATUS_INVALID_PARAMETER | STATUS_INVALID_INFO_CLASS | STATUS_NOT_SUPPORTED
+                )
+            {
+                class = RenameClass::Classic;
+                continue;
+            }
+            break status;
+        };
+        if status >= 0 {
+            return Ok(true);
+        }
+        if matches!(
+            status,
+            STATUS_INVALID_PARAMETER | STATUS_INVALID_INFO_CLASS | STATUS_NOT_SUPPORTED
+        ) {
+            return Ok(false);
+        }
+        let code = unsafe {
+            // SAFETY: `status` is the NTSTATUS returned by `NtSetInformationFile`.
+            RtlNtStatusToDosError(status)
+        };
+        let error = io::Error::from_raw_os_error(code as i32);
+        if !matches!(code, ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED)
+            || delay_ms == 4_050
+            || (code == ERROR_ACCESS_DENIED && is_unreplaceable_destination(destination))
+        {
+            return Err(error);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn verbatim_to_nt_path(extended: &[u16]) -> io::Result<Vec<u16>> {
+    const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const NT: [u16; 4] = [b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16];
+    let rest = extended
+        .strip_prefix(&VERBATIM)
+        .ok_or_else(|| io::Error::other("atomic destination path has no extended prefix"))?;
+    let mut out = Vec::with_capacity(NT.len() + rest.len());
+    out.extend_from_slice(&NT);
+    out.extend_from_slice(rest);
+    Ok(out)
 }
 
 impl Drop for CreatedTemporary {
@@ -1376,7 +1460,7 @@ fn replace_file(from: &Path, to: &Path, write_through: bool) -> io::Result<()> {
     } else {
         MOVEFILE_REPLACE_EXISTING
     };
-    for delay_ms in [0, 50, 150, 450, 1_350, 4_050] {
+    for delay_ms in [0, 5, 15, 50, 150, 450, 1_350, 4_050] {
         if delay_ms != 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
@@ -1392,7 +1476,7 @@ fn replace_file(from: &Path, to: &Path, write_through: bool) -> io::Result<()> {
             raw,
             Some(ERROR_SHARING_VIOLATION) | Some(ERROR_ACCESS_DENIED)
         ) || delay_ms == 4_050
-            || (raw == Some(ERROR_ACCESS_DENIED) && is_directory_entry(destination))
+            || (raw == Some(ERROR_ACCESS_DENIED) && is_unreplaceable_destination(destination))
         {
             return Err(error);
         }
@@ -1400,16 +1484,20 @@ fn replace_file(from: &Path, to: &Path, write_through: bool) -> io::Result<()> {
     Err(io::Error::other("atomic replacement retry loop exhausted"))
 }
 
-/// Whether `path` is a directory, or a link to one, which a renamed file can
-/// never replace: Windows reports that as ACCESS_DENIED, as it does a file a
-/// scanner holds for a moment, so the retries against the latter would only
-/// delay the error.
+/// Whether `path` is a directory, a directory symlink, or a read-only file,
+/// none of which an atomic file rename can replace: Windows reports those as
+/// `ACCESS_DENIED` just like a transient scanner lock, so retrying would only
+/// stall before returning the same error.
 #[cfg(windows)]
-fn is_directory_entry(path: &Path) -> bool {
-    use std::os::windows::fs::FileTypeExt as _;
+fn is_unreplaceable_destination(path: &Path) -> bool {
+    use std::os::windows::fs::{FileTypeExt as _, MetadataExt as _};
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
+
     fs::symlink_metadata(path).is_ok_and(|metadata| {
         let file_type = metadata.file_type();
-        file_type.is_dir() || file_type.is_symlink_dir()
+        file_type.is_dir()
+            || file_type.is_symlink_dir()
+            || (metadata.file_attributes() & FILE_ATTRIBUTE_READONLY != 0)
     })
 }
 

@@ -390,12 +390,12 @@ fn clear_open_directory(directory: &Dir) -> Result<u64, LpmError> {
 }
 
 #[cfg(not(windows))]
-fn cap_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+pub(super) fn cap_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
     metadata.is_symlink()
 }
 
 #[cfg(windows)]
-fn cap_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+pub(super) fn cap_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
     use cap_std::fs::MetadataExt as _;
 
     metadata.file_attributes() & 0x400 != 0
