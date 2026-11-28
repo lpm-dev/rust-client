@@ -625,12 +625,12 @@ impl PendingFile {
         #[cfg(windows)]
         {
             let mut pending = self;
-            let directory = Arc::clone(&pending.directory);
-            let name = std::mem::take(&mut pending.name);
             // Open a non-write pin handle before closing the write handle so the
             // file identity stays pinned until commit while NTFS flushes timestamps
             // on write-handle cleanup.
-            let pin = open_read_pin_nofollow(&directory, &name, identity)?;
+            let pin = open_read_pin_nofollow(&pending.directory, &pending.name, identity)?;
+            let directory = Arc::clone(&pending.directory);
+            let name = std::mem::take(&mut pending.name);
             pending.committed = true;
             drop(pending);
             Ok(CompletedFile {
@@ -657,12 +657,14 @@ impl PendingFile {
         let identity = self.identity()?;
         #[cfg(windows)]
         let stamp = {
-            let directory = Arc::clone(&self.directory);
-            let name = std::mem::take(&mut self.name);
-            let pin = open_read_pin_nofollow(&directory, &name, identity)?;
+            // Only capture a post-close stamp when the path still resolves to
+            // the written file identity; otherwise commit the original identity
+            // with `None` (matching Unix) so callers rehash and rollback never
+            // deletes a replacement leaf.
+            let pin = open_read_pin_nofollow(&self.directory, &self.name, identity).ok();
             self.committed = true;
             drop(self);
-            stamp_from_closed_writer_pin(&pin)
+            pin.as_ref().and_then(stamp_from_closed_writer_pin)
         };
         #[cfg(not(windows))]
         let stamp = {
@@ -827,12 +829,12 @@ mod tests {
         pending.commit();
         let identity = output.accepted_file_identity(path).unwrap();
         assert!(identity == written_identity);
-        output
-            .prepare_parent(
-                Path::new("root-file"),
-                &mut PathLedgerBudget::new(usize::MAX),
-            )
-            .unwrap();
+        let mut budget = PathLedgerBudget::new(usize::MAX);
+        for index in 0..=MAX_CACHED_PARENTS {
+            output
+                .prepare_parent(&PathBuf::from(format!("evict-{index}/file")), &mut budget)
+                .unwrap();
+        }
         std::fs::rename(root.join("lib"), root.join("moved")).unwrap();
         std::fs::create_dir(root.join("lib")).unwrap();
         std::fs::write(root.join(path), b"keep").unwrap();
@@ -867,6 +869,21 @@ mod tests {
         assert_eq!(error.raw_os_error(), Some(32));
         output
             .prepare_parent(Path::new("root-file"), &mut budget)
+            .unwrap();
+        let parked_error = std::fs::rename(root.join("lib"), root.join("moved")).unwrap_err();
+        assert_eq!(parked_error.raw_os_error(), Some(32));
+        for index in 0..MAX_CACHED_PARENTS {
+            output
+                .prepare_parent(&PathBuf::from(format!("evict-{index}/file")), &mut budget)
+                .unwrap();
+        }
+        let tail_error = std::fs::rename(root.join("lib"), root.join("moved")).unwrap_err();
+        assert_eq!(tail_error.raw_os_error(), Some(32));
+        output
+            .prepare_parent(
+                &PathBuf::from(format!("evict-{MAX_CACHED_PARENTS}/file")),
+                &mut budget,
+            )
             .unwrap();
         std::fs::rename(root.join("lib"), root.join("moved")).unwrap();
         assert!(output.validate().is_err());

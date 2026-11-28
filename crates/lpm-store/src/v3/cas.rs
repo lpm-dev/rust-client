@@ -1927,6 +1927,10 @@ impl FileCas {
                 source.display()
             )));
         }
+        // Release the read handle before publishing so Windows does not keep a
+        // delete-pending tombstone if `HardlinkReplaceGuard` replaces and
+        // unlinks the staged backup.
+        drop(file);
         let compact_id = CompactBlobId::from_raw(raw_digest, mode, size);
         let key = BlobKey {
             digest: blake3::Hash::from_bytes(raw_digest).to_hex().to_string(),
@@ -3507,16 +3511,17 @@ impl BlobStatFingerprint {
     }
 
     fn same_content_identity(self, other: Self) -> bool {
+        // Omit `creation_time`: NTFS file-system tunneling can overwrite
+        // `ftCreationTime` when rolling back a staged rename onto a recently
+        // unlinked path.
         (
             self.volume_serial_number,
             self.file_index,
-            self.creation_time,
             self.last_write_time,
             self.file_attributes,
         ) == (
             other.volume_serial_number,
             other.file_index,
-            other.creation_time,
             other.last_write_time,
             other.file_attributes,
         )
@@ -4518,6 +4523,48 @@ mod tests {
         assert_eq!(
             cas.read_source_record("local-source").unwrap().tree_digest,
             second.record.tree_digest
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_content_identity_tolerates_ntfs_tunneled_creation_time() {
+        let base = BlobStatFingerprint {
+            volume_serial_number: 7,
+            file_index: 42,
+            creation_time: 100,
+            last_write_time: 200,
+            change_time: 300,
+            file_attributes: 0x20,
+            nlink: 1,
+        };
+        let tunneled = BlobStatFingerprint {
+            creation_time: 90,
+            change_time: 350,
+            nlink: 2,
+            ..base
+        };
+        assert!(tunneled.same_content_identity(base));
+        assert!(
+            !BlobStatFingerprint {
+                last_write_time: 201,
+                ..tunneled
+            }
+            .same_content_identity(base)
+        );
+        assert!(
+            !BlobStatFingerprint {
+                file_attributes: 0x21,
+                ..tunneled
+            }
+            .same_content_identity(base)
+        );
+        assert!(
+            !BlobStatFingerprint {
+                file_index: 43,
+                ..tunneled
+            }
+            .same_content_identity(base)
         );
     }
 
