@@ -90,13 +90,10 @@ pub(super) fn run_async_main() -> Result<()> {
             if let Some(workers) = workers {
                 runtime_builder.worker_threads(workers);
             }
-            if let Some(max_blocking_threads) = std::env::var("LPM_MAX_BLOCKING_THREADS")
-                .ok()
-                .and_then(|s| s.parse::<std::num::NonZeroUsize>().ok())
-                .map(std::num::NonZeroUsize::get)
-            {
-                runtime_builder.max_blocking_threads(max_blocking_threads);
-            }
+            let max_blocking_threads = resolve_max_blocking_threads(
+                std::env::var("LPM_MAX_BLOCKING_THREADS").ok().as_deref(),
+            );
+            runtime_builder.max_blocking_threads(max_blocking_threads);
             let result = runtime_builder
                 .build()
                 .expect("failed to create tokio runtime")
@@ -107,6 +104,14 @@ pub(super) fn run_async_main() -> Result<()> {
         .expect("failed to spawn async main thread")
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+const DEFAULT_MAX_BLOCKING_THREADS: usize = 128;
+
+fn resolve_max_blocking_threads(env_override: Option<&str>) -> usize {
+    env_override
+        .and_then(|s| s.parse::<std::num::NonZeroUsize>().ok())
+        .map_or(DEFAULT_MAX_BLOCKING_THREADS, std::num::NonZeroUsize::get)
 }
 
 /// Keeps the project's `.lpm` and the LPM home out of git after any
@@ -554,6 +559,23 @@ mod tests {
         assert_eq!(
             runtime_worker_threads(cli.command.as_ref(), false, 18, Some(project.path())),
             None
+        );
+    }
+
+    #[test]
+    fn blocking_thread_pool_defaults_to_bounded_cap_and_honors_env_override() {
+        assert_eq!(
+            super::resolve_max_blocking_threads(None),
+            super::DEFAULT_MAX_BLOCKING_THREADS
+        );
+        assert_eq!(super::resolve_max_blocking_threads(Some("24")), 24);
+        assert_eq!(
+            super::resolve_max_blocking_threads(Some("0")),
+            super::DEFAULT_MAX_BLOCKING_THREADS
+        );
+        assert_eq!(
+            super::resolve_max_blocking_threads(Some("not-a-number")),
+            super::DEFAULT_MAX_BLOCKING_THREADS
         );
     }
 }

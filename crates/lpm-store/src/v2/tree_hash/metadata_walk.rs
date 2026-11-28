@@ -54,19 +54,25 @@ impl MetadataReader {
     fn read(
         self,
         root: &Path,
+        #[cfg(target_os = "linux")] root_fd: Option<std::os::fd::BorrowedFd<'_>>,
         dir: &Path,
         buffer: &mut [u8],
     ) -> Result<Vec<ObjectTreeEntry>, LpmError> {
         match self {
             #[cfg(target_os = "macos")]
             Self::Bulk => {
-                let mut entries = read_bulk_metadata_entries(dir, buffer)?;
+                let mut entries = read_bulk_metadata_entries_confined(root, dir, buffer)?;
                 entries.retain(|entry| !is_object_metadata_sidecar_name(root, dir, &entry.name));
                 Ok(entries)
             }
             Self::Portable => {
                 let _ = buffer;
-                read_object_tree_entries(root, dir)
+                read_object_tree_entries_with_root(
+                    root,
+                    #[cfg(target_os = "linux")]
+                    root_fd,
+                    dir,
+                )
             }
         }
     }
@@ -114,6 +120,8 @@ struct WalkState {
 
 struct Walk<'a> {
     root: &'a Path,
+    #[cfg(target_os = "linux")]
+    root_fd: Option<std::os::fd::OwnedFd>,
     reader: MetadataReader,
     state: Mutex<WalkState>,
     changed: Condvar,
@@ -145,7 +153,13 @@ impl Walk<'_> {
     fn process(&self, dir: PendingDir, buffer: &mut [u8]) -> usize {
         let read = self
             .reader
-            .read(self.root, &dir.path, buffer)
+            .read(
+                self.root,
+                #[cfg(target_os = "linux")]
+                self.root_fd.as_ref().map(std::os::fd::AsFd::as_fd),
+                &dir.path,
+                buffer,
+            )
             .map(|entries| {
                 entries
                     .into_iter()
@@ -216,6 +230,10 @@ struct Collected {
 fn collect(root: &Path, reader: MetadataReader) -> Collected {
     let walk = Walk {
         root,
+        #[cfg(target_os = "linux")]
+        root_fd: has_persistent_root_fd_headroom()
+            .then(|| open_root_dir_fd(root).ok())
+            .flatten(),
         reader,
         state: Mutex::new(WalkState {
             pending: vec![PendingDir {

@@ -131,7 +131,32 @@ const MAX_CLEAR_OPEN_DIRS: usize = 24;
 struct ClearDirFrame {
     name_in_parent: Option<std::ffi::OsString>,
     dir: Option<cap_std::fs::Dir>,
+    dir_identity: Option<crate::FileIdentity>,
     pending: Vec<std::ffi::OsString>,
+}
+
+fn cap_dir_identity(directory: &cap_std::fs::Dir) -> Option<crate::FileIdentity> {
+    #[cfg(unix)]
+    {
+        use cap_fs_ext::MetadataExt as _;
+
+        let metadata = directory.dir_metadata().ok()?;
+        Some(crate::FileIdentity {
+            volume: metadata.dev(),
+            file_id: u128::from(metadata.ino()),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
+
+        crate::FileIdentity::from_raw_handle(directory.as_handle().as_raw_handle()).ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = directory;
+        None
+    }
 }
 
 fn collect_dir_entry_names(
@@ -145,15 +170,45 @@ fn collect_dir_entry_names(
 }
 
 fn evict_oldest_open_dir(stack: &mut [ClearDirFrame], open_dirs: &mut usize, protected_idx: usize) {
-    for (idx, frame) in stack.iter_mut().enumerate().skip(1) {
-        if idx == protected_idx {
+    // Preserve up to 4 evenly-spaced ancestor checkpoints so ascending a deep
+    // linear chain reopens from the nearest checkpoint rather than from root.
+    let stride = (protected_idx / 4).max(1);
+    let mut fallback: Option<usize> = None;
+    for (idx, frame) in stack.iter().enumerate().skip(1) {
+        if idx == protected_idx || frame.dir.is_none() {
             continue;
         }
-        if frame.dir.take().is_some() {
+        if fallback.is_none() {
+            fallback = Some(idx);
+        }
+        if !idx.is_multiple_of(stride) {
+            stack[idx].dir = None;
             *open_dirs -= 1;
             return;
         }
     }
+    if let Some(idx) = fallback {
+        stack[idx].dir = None;
+        *open_dirs -= 1;
+    }
+}
+
+fn verify_reopened_dir_identity(
+    opened: &cap_std::fs::Dir,
+    expected: Option<crate::FileIdentity>,
+) -> std::io::Result<()> {
+    if let Some(expected_id) = expected {
+        match cap_dir_identity(opened) {
+            Some(actual_id) if actual_id == expected_id => {}
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "directory identity changed during removal",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_top_dir_open(
@@ -190,7 +245,9 @@ fn ensure_top_dir_open(
             .name_in_parent
             .as_deref()
             .expect("non-root frame carries its entry name");
-        transient = Some(parent_ref.open_dir_nofollow(name)?);
+        let opened = parent_ref.open_dir_nofollow(name)?;
+        verify_reopened_dir_identity(&opened, stack[step].dir_identity)?;
+        transient = Some(opened);
     }
 
     for step in window_start.max(anchor + 1)..=top {
@@ -212,6 +269,7 @@ fn ensure_top_dir_open(
             .as_deref()
             .expect("non-root frame carries its entry name");
         let opened = parent_ref.open_dir_nofollow(name)?;
+        verify_reopened_dir_identity(&opened, stack[step].dir_identity)?;
         transient = None;
         stack[step].dir = Some(opened);
         *open_dirs += 1;
@@ -220,15 +278,48 @@ fn ensure_top_dir_open(
     Ok(())
 }
 
+#[cfg(test)]
+enum ClearTestEvent {
+    AfterEnumerate,
+    EvictedDir,
+}
+
+#[cfg(test)]
+fn clear_directory_with_test_hook(
+    tree: &Path,
+    mut hook: impl FnMut(ClearTestEvent),
+) -> std::io::Result<u64> {
+    let dir = cap_std::fs::Dir::open_ambient_dir(tree, cap_std::ambient_authority())?;
+    clear_directory_counting_freed_bytes_inner(&dir, &mut hook)
+}
+
 fn clear_directory_counting_freed_bytes(directory: &cap_std::fs::Dir) -> std::io::Result<u64> {
+    #[cfg(test)]
+    {
+        clear_directory_counting_freed_bytes_inner(directory, &mut |_| {})
+    }
+    #[cfg(not(test))]
+    {
+        clear_directory_counting_freed_bytes_inner(directory)
+    }
+}
+
+fn clear_directory_counting_freed_bytes_inner(
+    directory: &cap_std::fs::Dir,
+    #[cfg(test)] hook: &mut dyn FnMut(ClearTestEvent),
+) -> std::io::Result<u64> {
     use cap_fs_ext::DirExt as _;
 
     let mut freed = 0u64;
     let mut open_dirs = 0usize;
+    let pending = collect_dir_entry_names(directory)?;
+    #[cfg(test)]
+    hook(ClearTestEvent::AfterEnumerate);
     let mut stack = vec![ClearDirFrame {
         name_in_parent: None,
         dir: None,
-        pending: collect_dir_entry_names(directory)?,
+        dir_identity: cap_dir_identity(directory),
+        pending,
     }];
 
     while !stack.is_empty() {
@@ -247,7 +338,11 @@ fn clear_directory_counting_freed_bytes(directory: &cap_std::fs::Dir) -> std::io
                 } else {
                     stack[top].dir.as_ref().expect("parent directory is open")
                 };
-                parent_dir.remove_dir(&dir_name)?;
+                match parent_dir.remove_dir(&dir_name) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
             }
             continue;
         };
@@ -260,10 +355,16 @@ fn clear_directory_counting_freed_bytes(directory: &cap_std::fs::Dir) -> std::io
                 .as_ref()
                 .expect("active directory is open")
         };
-        let metadata = parent_dir.symlink_metadata(&name)?;
+        let metadata = match parent_dir.symlink_metadata(&name) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
         if metadata.is_dir() && !cap_metadata_is_link(&metadata) {
             if open_dirs >= MAX_CLEAR_OPEN_DIRS {
                 evict_oldest_open_dir(&mut stack, &mut open_dirs, parent_idx);
+                #[cfg(test)]
+                hook(ClearTestEvent::EvictedDir);
             }
             let parent_dir = if parent_idx == 0 {
                 directory
@@ -273,43 +374,66 @@ fn clear_directory_counting_freed_bytes(directory: &cap_std::fs::Dir) -> std::io
                     .as_ref()
                     .expect("active directory is open")
             };
-            let child = parent_dir.open_dir_nofollow(&name)?;
-            let child_pending = collect_dir_entry_names(&child)?;
+            let child = match parent_dir.open_dir_nofollow(&name) {
+                Ok(child) => child,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            let child_pending = match collect_dir_entry_names(&child) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
             if child_pending.is_empty() {
                 drop(child);
-                parent_dir.remove_dir(&name)?;
+                match parent_dir.remove_dir(&name) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
             } else {
+                let child_identity = cap_dir_identity(&child);
                 stack.push(ClearDirFrame {
                     name_in_parent: Some(name),
                     dir: Some(child),
+                    dir_identity: child_identity,
                     pending: child_pending,
                 });
                 open_dirs += 1;
             }
         } else if metadata.is_file() && !cap_metadata_is_link(&metadata) {
-            freed = freed.saturating_add(cap_remove_file_counting_freed_bytes(
-                parent_dir, &name, &metadata, true,
-            )?);
+            match cap_remove_file_counting_freed_bytes(parent_dir, &name, &metadata, true) {
+                Ok(delta) => freed = freed.saturating_add(delta),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
         } else {
-            parent_dir.remove_file_or_symlink(&name)?;
+            match parent_dir.remove_file_or_symlink(&name) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
         }
     }
 
     Ok(freed)
 }
 
-/// Return `((volume_id, file_id), link_count)` for a regular file without
-/// following symlinks, or `None` on platforms or filesystems where link
-/// identity cannot be queried.
+/// Return `(file_identity, link_count)` for a regular file without following
+/// symlinks, or `None` on platforms or filesystems where link identity cannot
+/// be queried.
 pub fn file_link_identity_and_count(
     path: &Path,
     metadata: &std::fs::Metadata,
-) -> Option<((u64, u64), u64)> {
+) -> Option<(crate::FileIdentity, u64)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
         let _ = path;
-        Some(((metadata.dev(), metadata.ino()), metadata.nlink()))
+        Some((
+            crate::FileIdentity::from_unix_metadata(metadata),
+            metadata.nlink(),
+        ))
     }
     #[cfg(windows)]
     {
@@ -325,12 +449,9 @@ pub fn file_link_identity_and_count(
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
             .ok()?;
-        let info = crate::atomic_write::windows_file_information(&file).ok()?;
-        let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
-        Some((
-            (u64::from(info.dwVolumeSerialNumber), file_index),
-            u64::from(info.nNumberOfLinks),
-        ))
+        let identity = crate::FileIdentity::from_open_file(&file).ok()?;
+        let nlink = crate::link_count(&file).ok()?;
+        Some((identity, nlink))
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -851,10 +972,47 @@ fn has_parent_dir_after_non_parent(path: &Path) -> bool {
     false
 }
 
+fn leading_parent_dir_count(path: &Path) -> usize {
+    let mut count = 0usize;
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => count += 1,
+            _ => break,
+        }
+    }
+    count
+}
+
+fn parent_traversal_crosses_symlink(link_path: &Path, parent_pops: usize) -> bool {
+    if parent_pops == 0 {
+        return false;
+    }
+    let Some(mut ancestor) = link_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return false;
+    };
+    for _ in 0..parent_pops {
+        if std::fs::symlink_metadata(ancestor).is_ok_and(|meta| is_symlink_or_junction(&meta)) {
+            return true;
+        }
+        let Some(next) = ancestor
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        else {
+            break;
+        };
+        ancestor = next;
+    }
+    false
+}
+
 /// Compare an existing symlink/junction target read from `link_path` against
 /// `expected_target`, refusing lexical `..` collapse after any normal or root
-/// component (where intermediate symlinks would resolve elsewhere) and
-/// normalizing clean Windows `\\?\` / `\??\` prefixes and drive-letter case.
+/// component (or across a symlinked ancestor of `link_path`) and normalizing
+/// clean Windows `\\?\` / `\??\` prefixes and drive-letter case.
 pub fn link_targets_equivalent(
     existing_target: &Path,
     link_path: &Path,
@@ -866,6 +1024,11 @@ pub fn link_targets_equivalent(
     if has_parent_dir_after_non_parent(existing_target)
         || has_parent_dir_after_non_parent(expected_target)
     {
+        return false;
+    }
+    let max_pops =
+        leading_parent_dir_count(existing_target).max(leading_parent_dir_count(expected_target));
+    if parent_traversal_crosses_symlink(link_path, max_pops) {
         return false;
     }
     let resolved_existing = resolve_symlink_probe_path(existing_target, link_path);
@@ -908,7 +1071,10 @@ pub(crate) fn normalize_windows_link_target_str(raw: &str) -> Option<String> {
             return None;
         }
         let trimmed = body.trim_end_matches('\\');
-        if trimmed.split('\\').any(|seg| seg == "." || seg == "..") {
+        if trimmed
+            .split('\\')
+            .any(|seg| seg == "." || seg == ".." || seg.ends_with('.') || seg.ends_with(' '))
+        {
             return None;
         }
         let canonical = if is_unc_verbatim {
@@ -949,6 +1115,8 @@ pub(crate) fn normalize_windows_link_target_str(raw: &str) -> Option<String> {
     {
         let drive = s.as_bytes()[0].to_ascii_uppercase() as char;
         (format!("{drive}:\\"), &s[3..])
+    } else if let Some(rooted) = s.strip_prefix('\\') {
+        ("\\".to_string(), rooted)
     } else {
         (String::new(), s.as_str())
     };
@@ -965,6 +1133,9 @@ pub(crate) fn normalize_windows_link_target_str(raw: &str) -> Option<String> {
                 parts.push("..");
             }
             other => {
+                if other.ends_with('.') || other.ends_with(' ') {
+                    return None;
+                }
                 seen_normal = true;
                 parts.push(other);
             }
@@ -1796,6 +1967,135 @@ mod entry_removal_tests {
             super::normalize_windows_link_target_str(r"C:\dir\Pkg"),
             "Windows drive letters remain case-insensitive"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_targets_equivalent_rejects_relative_parent_crossing_symlinked_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let real_nested = root.path().join("real/a/b");
+        let real_parent_pkg = root.path().join("real/a/pkg");
+        let root_pkg = root.path().join("pkg");
+        std::fs::create_dir_all(&real_nested).unwrap();
+        std::fs::create_dir_all(&real_parent_pkg).unwrap();
+        std::fs::create_dir_all(&root_pkg).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&real_nested, &alias).unwrap();
+        let link = alias.join("dep");
+        std::os::unix::fs::symlink(Path::new("../pkg"), &link).unwrap();
+
+        assert!(
+            !super::link_targets_equivalent(&std::fs::read_link(&link).unwrap(), &link, &root_pkg,),
+            "relative ../pkg under a symlinked ancestor resolves to real/a/pkg, not root/pkg"
+        );
+    }
+
+    #[test]
+    fn normalize_windows_link_target_rejects_trailing_dot_or_space_and_preserves_root_relative() {
+        assert_eq!(
+            super::normalize_windows_link_target_str(r"\\?\C:\dir\pkg."),
+            None,
+            "verbatim component with trailing dot must not normalize to DOS spelling"
+        );
+        assert_eq!(
+            super::normalize_windows_link_target_str(r"C:\dir\pkg."),
+            None,
+            "DOS component with trailing dot must not equate to verbatim spelling"
+        );
+        assert_eq!(
+            super::normalize_windows_link_target_str(r"\\?\C:\dir\pkg "),
+            None,
+            "verbatim component with trailing space must not normalize to DOS spelling"
+        );
+        assert_eq!(
+            super::normalize_windows_link_target_str(r"\foo\bar").as_deref(),
+            Some(r"\foo\bar"),
+            "root-relative Windows path must retain its leading backslash"
+        );
+        assert_ne!(
+            super::normalize_windows_link_target_str(r"\foo\bar"),
+            super::normalize_windows_link_target_str(r"foo\bar"),
+            "root-relative Windows path must never equal a relative path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn counting_removal_stops_when_evicted_ancestor_is_replaced_by_another_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("tree");
+        let moved = root.path().join("moved-d0");
+        let replacement = tree.join("d0");
+        std::fs::create_dir_all(&replacement).unwrap();
+        let mut cur = replacement.clone();
+        // Create depth = MAX_CLEAR_OPEN_DIRS so ONLY d0 is evicted while d1..=d24 stay open
+        // in the sliding window.
+        for depth in 1..=super::MAX_CLEAR_OPEN_DIRS {
+            cur = cur.join(format!("d{depth}"));
+        }
+        std::fs::create_dir_all(&cur).unwrap();
+        std::fs::write(cur.join("leaf.txt"), b"leaf").unwrap();
+        for idx in 0..8 {
+            std::fs::write(replacement.join(format!("keep-{idx}.txt")), b"orig").unwrap();
+        }
+
+        let swapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapped_clone = std::sync::Arc::clone(&swapped);
+        let d0_path = replacement.clone();
+        let moved_path = moved;
+        let result = super::clear_directory_with_test_hook(&tree, move |event| {
+            if matches!(event, super::ClearTestEvent::EvictedDir)
+                && !swapped_clone.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let _ = std::fs::rename(&d0_path, &moved_path);
+                let _ = std::fs::create_dir_all(d0_path.join("d1"));
+                for idx in 0..8 {
+                    let _ = std::fs::write(d0_path.join(format!("keep-{idx}.txt")), b"precious");
+                }
+            }
+        });
+        assert!(swapped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            result.is_err(),
+            "reopening an evicted ancestor that was swapped for another directory must fail"
+        );
+        assert!(
+            replacement.join("d1").is_dir(),
+            "replacement directory child d1 must survive"
+        );
+        for idx in 0..8 {
+            assert_eq!(
+                std::fs::read(replacement.join(format!("keep-{idx}.txt"))).unwrap(),
+                b"precious",
+                "replacement directory file keep-{idx}.txt must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn counting_removal_continues_past_missing_child_and_counts_remaining_files() {
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("vanish.txt"), b"1234567890").unwrap();
+        std::fs::write(tree.join("stay.txt"), b"hello").unwrap();
+
+        let removed_once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let removed_clone = std::sync::Arc::clone(&removed_once);
+        let vanish_path = tree.join("vanish.txt");
+        let freed = super::clear_directory_with_test_hook(&tree, move |event| {
+            if matches!(event, super::ClearTestEvent::AfterEnumerate)
+                && !removed_clone.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let _ = std::fs::remove_file(&vanish_path);
+            }
+        })
+        .expect("a child disappearing after enumeration must not abort counting removal");
+        assert_eq!(
+            freed, 5,
+            "remaining file bytes must still be counted when a sibling vanished"
+        );
+        assert!(!tree.join("stay.txt").exists());
     }
 }
 

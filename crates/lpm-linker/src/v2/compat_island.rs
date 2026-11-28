@@ -187,6 +187,7 @@ pub(super) fn manifest_needs_bin_compatibility(content: &[u8]) -> bool {
     const PEERS_KEY: &[u8] = b"\"peerDependencies\"";
     content.windows(DEPS_KEY.len()).any(|w| w == DEPS_KEY)
         || content.windows(PEERS_KEY.len()).any(|w| w == PEERS_KEY)
+        || content.windows(2).any(|w| w == b"\\u")
 }
 
 pub(super) fn create_project_compatibility_links(
@@ -1982,5 +1983,18 @@ mod manifest_tests {
             lpm_workspace::parse_name_and_bin_field(b"\xEF\xBB\xBF{\"name\":\"marked\"}").unwrap();
         assert_eq!(name.as_deref(), Some("marked"));
         assert!(bin.is_none());
+    }
+
+    #[test]
+    fn manifest_needs_bin_compatibility_handles_unicode_escaped_dependency_keys() {
+        assert!(super::manifest_needs_bin_compatibility(
+            br#"{"name":"cli","bin":"./cli.js","dep\u0065ndencies":{"a":"1.0.0"}}"#
+        ));
+        assert!(super::manifest_needs_bin_compatibility(
+            br#"{"name":"cli","bin":"./cli.js","peerDep\u0065ndencies":{"a":"1.0.0"}}"#
+        ));
+        assert!(!super::manifest_needs_bin_compatibility(
+            br#"{"name":"cli","bin":"./cli.js","version":"1.0.0"}"#
+        ));
     }
 }

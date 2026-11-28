@@ -596,14 +596,38 @@ fn linux_warm_materialization_uses_lower_4kib_reflink_threshold_and_parses_overl
         Some(false)
     );
 
-    let conflicting_prefix_mountinfo = concat!(
+    let docker_bind_btrfs_mountinfo = concat!(
         "100 99 0:45 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A,upperdir=/var/lib/docker/overlay2/abc/diff,workdir=/var/lib/docker/overlay2/abc/work\n",
         "101 100 0:30 /var/lib/docker/containers/abc/resolv.conf /etc/resolv.conf rw,relatime - btrfs /dev/nvme0n1p2 rw,space_cache=v2\n",
     );
     assert_eq!(
         super::linux_overlay_upperdir_is_btrfs_from_mountinfo(
             Path::new("/workspace/project"),
-            conflicting_prefix_mountinfo.as_bytes()
+            docker_bind_btrfs_mountinfo.as_bytes()
+        ),
+        Some(true)
+    );
+
+    let podman_bind_btrfs_mountinfo = concat!(
+        "100 99 0:45 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/containers/storage/overlay/l/A,upperdir=/var/lib/containers/storage/overlay/abc/diff,workdir=/var/lib/containers/storage/overlay/abc/work\n",
+        "101 100 0:30 /var/lib/containers/storage/overlay-containers/abc/userdata/resolv.conf /etc/resolv.conf rw,relatime - btrfs /dev/nvme0n1p2 rw,space_cache=v2\n",
+    );
+    assert_eq!(
+        super::linux_overlay_upperdir_is_btrfs_from_mountinfo(
+            Path::new("/workspace/project"),
+            podman_bind_btrfs_mountinfo.as_bytes()
+        ),
+        Some(true)
+    );
+
+    let unrelated_var_lib_mountinfo = concat!(
+        "100 99 0:45 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A,upperdir=/var/lib/docker/overlay2/abc/diff,workdir=/var/lib/docker/overlay2/abc/work\n",
+        "101 100 0:30 /var/lib/other/containers/abc/resolv.conf /etc/resolv.conf rw,relatime - btrfs /dev/nvme0n1p2 rw,space_cache=v2\n",
+    );
+    assert_eq!(
+        super::linux_overlay_upperdir_is_btrfs_from_mountinfo(
+            Path::new("/workspace/project"),
+            unrelated_var_lib_mountinfo.as_bytes()
         ),
         None
     );

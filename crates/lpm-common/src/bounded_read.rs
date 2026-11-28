@@ -334,6 +334,13 @@ impl FileIdentity {
             file_id: u128::from(metadata.ino()),
         }
     }
+
+    #[cfg(windows)]
+    pub(crate) fn from_raw_handle(
+        handle: windows_sys::Win32::Foundation::HANDLE,
+    ) -> io::Result<Self> {
+        windows_file_identity_from_raw_handle(handle)
+    }
 }
 
 #[cfg(windows)]
@@ -348,18 +355,27 @@ pub struct WindowsFileStamp {
 #[cfg(windows)]
 fn windows_file_identity_from_open_file(file: &std::fs::File) -> io::Result<FileIdentity> {
     use std::os::windows::io::AsRawHandle as _;
+
+    windows_file_identity_from_raw_handle(file.as_raw_handle())
+}
+
+#[cfg(windows)]
+fn windows_file_identity_from_raw_handle(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> io::Result<FileIdentity> {
     use windows_sys::Win32::Foundation::{
         ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+        BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx,
     };
 
     let mut info = FILE_ID_INFO::default();
-    // SAFETY: `file` holds a live handle and `info` is valid writable storage for `FILE_ID_INFO`.
+    // SAFETY: `handle` is live and `info` is valid writable storage for `FILE_ID_INFO`.
     let ok = unsafe {
         GetFileInformationByHandleEx(
-            file.as_raw_handle(),
+            handle,
             FileIdInfo,
             (&raw mut info).cast(),
             std::mem::size_of::<FILE_ID_INFO>() as u32,
@@ -379,7 +395,13 @@ fn windows_file_identity_from_open_file(file: &std::fs::File) -> io::Result<File
     ) {
         return Err(error);
     }
-    let legacy = handle_information(file)?;
+    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value of its
+    // plain integer fields, and the call only writes into it.
+    let mut legacy: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `handle` is live for the duration of this call.
+    if unsafe { GetFileInformationByHandle(handle, &mut legacy) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
     let index = (u64::from(legacy.nFileIndexHigh) << 32) | u64::from(legacy.nFileIndexLow);
     Ok(FileIdentity {
         volume: u64::from(legacy.dwVolumeSerialNumber),

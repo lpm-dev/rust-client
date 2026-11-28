@@ -4499,18 +4499,10 @@ fn dependency_links_match(
         };
         if actual != expected {
             #[cfg(windows)]
-            if actual.is_absolute() {
-                if lpm_common::link_targets_equivalent(&actual, &link, &expected) {
-                    continue;
-                }
-                let parent = link
-                    .parent()
-                    .ok_or_else(|| LpmError::Store("dependency link has no parent".into()))?;
-                if normalized_link_target(&actual)?
-                    == normalized_link_target(&parent.join(&expected))?
-                {
-                    continue;
-                }
+            if actual.is_absolute()
+                && lpm_common::link_targets_equivalent(&actual, &link, &expected)
+            {
+                continue;
             }
             return Ok(false);
         }
@@ -4599,22 +4591,6 @@ fn wrapper_slots_match(
         }
     }
     Ok(found == expected.len())
-}
-
-#[cfg(windows)]
-fn normalized_link_target(path: &Path) -> Result<PathBuf, LpmError> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    lpm_common::paths::absolute_extended_path(&normalized)
-        .map_err(|error| LpmError::Store(error.to_string()))
 }
 
 fn link_entry_package_dir(dir: &Path, key: &GraphKey) -> PathBuf {
@@ -4831,17 +4807,45 @@ fn linux_overlay_upperdir_from_mountinfo(path: &Path, mountinfo: &[u8]) -> Optio
 }
 
 #[cfg(target_os = "linux")]
+fn container_runtime_bind_root_prefix(upper: &Path) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = upper.as_os_str().as_bytes();
+    for (driver_marker, bind_subdir) in [
+        (b"/overlay2/".as_slice(), b"/containers/".as_slice()),
+        (b"/overlay/".as_slice(), b"/overlay-containers/".as_slice()),
+    ] {
+        if let Some(pos) = bytes
+            .windows(driver_marker.len())
+            .position(|window| window == driver_marker)
+            && pos > 0
+        {
+            let mut prefix = Vec::with_capacity(pos + bind_subdir.len());
+            prefix.extend_from_slice(&bytes[..pos]);
+            prefix.extend_from_slice(bind_subdir);
+            return Some(prefix);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn linux_overlay_upperdir_is_btrfs_from_mountinfo(path: &Path, mountinfo: &[u8]) -> Option<bool> {
     use std::os::unix::ffi::OsStringExt;
 
     let upper = linux_overlay_upperdir_from_mountinfo(path, mountinfo)?;
+    let expected_bind_prefix = container_runtime_bind_root_prefix(&upper);
     let mut best_mount: Option<(usize, &[u8])> = None;
+    let mut best_container_bind: Option<(usize, &[u8])> = None;
 
     for line in mountinfo
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
         let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
+        let Some(mount_root_raw) = fields.get(3).copied() else {
+            continue;
+        };
         let Some(mount_point_raw) = fields.get(4).copied() else {
             continue;
         };
@@ -4854,9 +4858,8 @@ fn linux_overlay_upperdir_is_btrfs_from_mountinfo(path: &Path, mountinfo: &[u8])
         if fs_type == b"overlay" {
             continue;
         }
-        let mount_point = PathBuf::from(std::ffi::OsString::from_vec(unescape_mountinfo_bytes(
-            mount_point_raw,
-        )));
+        let mount_point_bytes = unescape_mountinfo_bytes(mount_point_raw);
+        let mount_point = PathBuf::from(std::ffi::OsString::from_vec(mount_point_bytes.clone()));
         if upper.starts_with(&mount_point) {
             let depth = mount_point.as_os_str().len();
             if best_mount
@@ -4866,9 +4869,28 @@ fn linux_overlay_upperdir_is_btrfs_from_mountinfo(path: &Path, mountinfo: &[u8])
                 best_mount = Some((depth, fs_type));
             }
         }
+        if let Some(bind_prefix) = expected_bind_prefix.as_deref()
+            && matches!(
+                mount_point_bytes.as_slice(),
+                b"/etc/resolv.conf" | b"/etc/hosts" | b"/etc/hostname"
+            )
+        {
+            let mount_root_bytes = unescape_mountinfo_bytes(mount_root_raw);
+            if mount_root_bytes.starts_with(bind_prefix) {
+                let depth = mount_root_bytes.len();
+                if best_container_bind
+                    .as_ref()
+                    .is_none_or(|(best_depth, _)| depth >= *best_depth)
+                {
+                    best_container_bind = Some((depth, fs_type));
+                }
+            }
+        }
     }
 
-    best_mount.map(|(_, fs_type)| fs_type == b"btrfs")
+    best_mount
+        .or(best_container_bind)
+        .map(|(_, fs_type)| fs_type == b"btrfs")
 }
 
 #[cfg(target_os = "linux")]

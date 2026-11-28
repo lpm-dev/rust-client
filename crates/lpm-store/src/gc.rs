@@ -23,7 +23,29 @@ fn next_retired_path(parent: &Path) -> PathBuf {
     parent.join(format!(".tmp.gc.{}.{nonce:016x}.{seq}", std::process::id()))
 }
 
-fn retire_store_entry(path: &Path, now: SystemTime) -> Result<Option<PathBuf>, LpmError> {
+const ACTIVE_RETIRE_SUFFIX: &str = ".active";
+
+fn retired_active_marker_path(retired: &Path) -> PathBuf {
+    let mut marker = retired.as_os_str().to_os_string();
+    marker.push(ACTIVE_RETIRE_SUFFIX);
+    PathBuf::from(marker)
+}
+
+fn has_fresh_active_marker(path: &Path, now: SystemTime) -> bool {
+    let marker = retired_active_marker_path(path);
+    let Ok(meta) = std::fs::symlink_metadata(&marker) else {
+        return false;
+    };
+    meta.modified()
+        .ok()
+        .is_some_and(|mtime| is_within_max_age(mtime, now, ABANDONED_TEMP_AGE))
+}
+
+fn clear_retired_active_marker(retired: &Path) {
+    let _ = std::fs::remove_file(retired_active_marker_path(retired));
+}
+
+fn retire_store_entry(path: &Path, _scan_now: SystemTime) -> Result<Option<PathBuf>, LpmError> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -36,23 +58,51 @@ fn retire_store_entry(path: &Path, now: SystemTime) -> Result<Option<PathBuf>, L
             last_collision = Some(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
             continue;
         }
+        let marker = retired_active_marker_path(&retired);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_collision = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        }
         match std::fs::rename(path, &retired) {
             Ok(()) => {
-                // Refresh mtime while holding the publication lock so a concurrent GC
-                // does not mistake a freshly retired old package for an abandoned temp dir.
-                let _ = std::fs::set_times(&retired, std::fs::FileTimes::new().set_modified(now));
+                // Capture retirement time now (not the pre-scan clock) and never follow
+                // symlinks/junctions when refreshing the retired entry's mtime.
+                let retire_now = SystemTime::now();
+                if let Ok(meta) = std::fs::symlink_metadata(&retired)
+                    && !lpm_common::is_symlink_or_junction(&meta)
+                {
+                    let _ = std::fs::set_times(
+                        &retired,
+                        std::fs::FileTimes::new().set_modified(retire_now),
+                    );
+                }
                 return Ok(Some(retired));
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_file(&marker);
+                return Ok(None);
+            }
             Err(err)
                 if matches!(
                     err.kind(),
                     std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
                 ) =>
             {
+                let _ = std::fs::remove_file(&marker);
                 last_collision = Some(err);
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                let _ = std::fs::remove_file(&marker);
+                return Err(err.into());
+            }
         }
     }
 
@@ -120,6 +170,35 @@ impl PackageStore {
             });
         }
 
+        // Pre-scan `.tmp.` subtrees for recent nested activity outside the publication
+        // lock so large abandoned staging trees never block concurrent publishers.
+        let pre_scan_now = SystemTime::now();
+        let mut abandoned_temp_mtimes: HashMap<String, SystemTime> = HashMap::new();
+        if let Ok(read_dir) = std::fs::read_dir(&store_dir) {
+            for entry in read_dir.flatten() {
+                let dir_name = entry.file_name().to_string_lossy().into_owned();
+                if !is_temp_store_dir_name(&dir_name) || dir_name.ends_with(ACTIVE_RETIRE_SUFFIX) {
+                    continue;
+                }
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if !meta.is_dir() || lpm_common::is_symlink_or_junction(&meta) {
+                    continue;
+                }
+                let Ok(mtime) = meta.modified() else {
+                    continue;
+                };
+                if !is_within_max_age(mtime, pre_scan_now, ABANDONED_TEMP_AGE)
+                    && !has_fresh_active_marker(&path, pre_scan_now)
+                    && !subtree_has_recent_activity(&path, pre_scan_now, ABANDONED_TEMP_AGE)
+                {
+                    abandoned_temp_mtimes.insert(dir_name, mtime);
+                }
+            }
+        }
+
         let mut kept = 0usize;
         let mut retired_packages: Vec<PathBuf> = Vec::new();
         let mut retired_junk: Vec<PathBuf> = Vec::new();
@@ -161,7 +240,7 @@ impl PackageStore {
                     continue;
                 }
 
-                if is_junk_store_dir(&path, &dir_name, now)
+                if is_junk_store_entry_locked(&path, &dir_name, now, &abandoned_temp_mtimes)
                     && let Some(retired) = retire_store_entry(&path, now)?
                 {
                     retired_junk.push(retired);
@@ -173,6 +252,7 @@ impl PackageStore {
         if let Err(err) = retire_result {
             for path in retired_packages.iter().chain(retired_junk.iter()) {
                 let _ = lpm_common::remove_path_entry(path);
+                clear_retired_active_marker(path);
             }
             return Err(err);
         }
@@ -180,21 +260,36 @@ impl PackageStore {
         let mut removed = 0usize;
         let mut freed_bytes: u64 = 0;
         for retired in retired_packages {
-            match lpm_common::remove_path_entry_counting_freed_bytes(&retired) {
+            let remove_result = lpm_common::remove_path_entry_counting_freed_bytes(&retired);
+            clear_retired_active_marker(&retired);
+            match remove_result {
                 Ok(freed) => {
                     freed_bytes = freed_bytes.saturating_add(freed);
                     removed += 1;
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::NotFound
+                        && matches!(
+                            std::fs::symlink_metadata(&retired),
+                            Err(meta_err) if meta_err.kind() == std::io::ErrorKind::NotFound
+                        ) =>
+                {
                     removed += 1;
                 }
                 Err(err) => return Err(err.into()),
             }
         }
         for retired in retired_junk {
-            match lpm_common::remove_path_entry(&retired) {
+            let remove_result = lpm_common::remove_path_entry(&retired);
+            clear_retired_active_marker(&retired);
+            match remove_result {
                 Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::NotFound
+                        && matches!(
+                            std::fs::symlink_metadata(&retired),
+                            Err(meta_err) if meta_err.kind() == std::io::ErrorKind::NotFound
+                        ) => {}
                 Err(err) => return Err(err.into()),
             }
         }
@@ -256,7 +351,7 @@ impl PackageStore {
 
         candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let mut seen_links: HashMap<(u64, u64), u64> = HashMap::new();
+        let mut seen_links: HashMap<lpm_common::FileIdentity, u64> = HashMap::new();
         let mut would_remove = Vec::with_capacity(candidates.len());
         let mut would_free_bytes: u64 = 0;
         for (key, path) in candidates {
@@ -288,7 +383,9 @@ impl PackageStore {
             };
             retired
         };
-        match lpm_common::remove_path_entry(&retired) {
+        let remove_result = lpm_common::remove_path_entry(&retired);
+        clear_retired_active_marker(&retired);
+        match remove_result {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
@@ -312,6 +409,41 @@ fn complete_package_from_dir(dir: &Path, dir_name: &str) -> Option<(String, Stri
     Some((pkg_name, version))
 }
 
+fn is_junk_store_entry_locked(
+    path: &Path,
+    dir_name: &str,
+    now: SystemTime,
+    abandoned_temp_mtimes: &HashMap<String, SystemTime>,
+) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if lpm_common::is_symlink_or_junction(&meta) {
+        return false;
+    }
+    if dir_name.ends_with(ACTIVE_RETIRE_SUFFIX) && is_temp_store_dir_name(dir_name) {
+        return meta.is_file()
+            && meta
+                .modified()
+                .ok()
+                .is_some_and(|mtime| !is_within_max_age(mtime, now, ABANDONED_TEMP_AGE));
+    }
+    if !meta.is_dir() {
+        return false;
+    }
+    if is_temp_store_dir_name(dir_name) {
+        let Some(&prescanned_mtime) = abandoned_temp_mtimes.get(dir_name) else {
+            return false;
+        };
+        return meta.modified().ok().is_some_and(|live_mtime| {
+            live_mtime == prescanned_mtime
+                && !is_within_max_age(live_mtime, now, ABANDONED_TEMP_AGE)
+        }) && !has_fresh_active_marker(path, now);
+    }
+    dir_name.rfind('@').is_some() && !is_complete_package_dir(path)
+}
+
+#[cfg(all(test, unix))]
 fn is_junk_store_dir(dir: &Path, dir_name: &str, now: SystemTime) -> bool {
     let Ok(meta) = std::fs::symlink_metadata(dir) else {
         return false;
@@ -324,7 +456,9 @@ fn is_junk_store_dir(dir: &Path, dir_name: &str, now: SystemTime) -> bool {
             .modified()
             .ok()
             .is_some_and(|mtime| !is_within_max_age(mtime, now, ABANDONED_TEMP_AGE));
-        return root_is_abandoned && !subtree_has_recent_activity(dir, now, ABANDONED_TEMP_AGE);
+        return root_is_abandoned
+            && !has_fresh_active_marker(dir, now)
+            && !subtree_has_recent_activity(dir, now, ABANDONED_TEMP_AGE);
     }
     dir_name.rfind('@').is_some() && !is_complete_package_dir(dir)
 }
@@ -384,7 +518,10 @@ pub struct GcPreview {
 /// Calculate reclaimable regular-file bytes in `root` without following links,
 /// matching [`lpm_common::remove_path_entry_counting_freed_bytes`]: a file is
 /// counted once when every link to its inode resides within the doomed set.
-fn reclaimable_dir_size(root: &Path, seen_links: &mut HashMap<(u64, u64), u64>) -> u64 {
+fn reclaimable_dir_size(
+    root: &Path,
+    seen_links: &mut HashMap<lpm_common::FileIdentity, u64>,
+) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -889,6 +1026,87 @@ mod tests {
         assert_eq!(
             preview.would_free_bytes, result.freed_bytes,
             "gc preview and gc apply must agree on hardlink-reclaimed bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_retire_does_not_follow_symlink_entry_for_mtime_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let external = dir.path().join("external-target");
+        std::fs::create_dir(&external).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(7200);
+        std::fs::set_times(&external, std::fs::FileTimes::new().set_modified(old)).unwrap();
+        let before_mtime = std::fs::metadata(&external).unwrap().modified().unwrap();
+
+        let store_v1 = dir.path().join("v1");
+        std::fs::create_dir_all(&store_v1).unwrap();
+        let link_entry = store_v1.join("sneaky@1.0.0");
+        std::os::unix::fs::symlink(&external, &link_entry).unwrap();
+
+        let retired = retire_store_entry(&link_entry, SystemTime::now())
+            .unwrap()
+            .expect("symlink entry should retire");
+        assert!(std::fs::symlink_metadata(&retired).unwrap().is_symlink());
+        let after_mtime = std::fs::metadata(&external).unwrap().modified().unwrap();
+        assert_eq!(
+            after_mtime, before_mtime,
+            "retiring a symlink entry must never follow it to modify the external target's mtime"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_retirement_protects_entry_from_concurrent_sweep_when_scan_exceeds_threshold_or_set_times_fails()
+     {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_v1 = dir.path().join("v1");
+        std::fs::create_dir_all(&store_v1).unwrap();
+        let old_pkg = store_v1.join("ancient@1.0.0");
+        std::fs::create_dir(&old_pkg).unwrap();
+        std::fs::write(old_pkg.join("index.js"), b"old").unwrap();
+        let very_old = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::set_times(&old_pkg, std::fs::FileTimes::new().set_modified(very_old)).unwrap();
+
+        // Case 1: passing a stale pre-scan timestamp older than ABANDONED_TEMP_AGE must
+        // not leave the freshly retired entry immediately eligible for a concurrent sweep.
+        let stale_scan_start = SystemTime::now() - (ABANDONED_TEMP_AGE + Duration::from_secs(120));
+        let retired = retire_store_entry(&old_pkg, stale_scan_start)
+            .unwrap()
+            .expect("old package should retire");
+        let retired_name = retired.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            !is_junk_store_dir(&retired, &retired_name, SystemTime::now()),
+            "freshly retired tombstone must not appear abandoned when scan start was older than ABANDONED_TEMP_AGE"
+        );
+        let _ = std::fs::remove_dir_all(&retired);
+
+        // Case 2: even when the retired directory itself cannot have its mtime updated,
+        // a concurrent collector must still see it as actively retired rather than abandoned.
+        let ro_pkg = store_v1.join("readonly-ancient@1.0.0");
+        std::fs::create_dir(&ro_pkg).unwrap();
+        std::fs::set_times(&ro_pkg, std::fs::FileTimes::new().set_modified(very_old)).unwrap();
+        std::fs::set_permissions(&ro_pkg, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let retired_ro = retire_store_entry(&ro_pkg, stale_scan_start)
+            .unwrap()
+            .expect("readonly package should retire");
+        let retired_ro_name = retired_ro
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // Force the directory mtime back to very_old to simulate set_times failure on unowned dirs.
+        let _ = std::fs::set_permissions(&retired_ro, std::fs::Permissions::from_mode(0o755));
+        std::fs::set_times(
+            &retired_ro,
+            std::fs::FileTimes::new().set_modified(very_old),
+        )
+        .unwrap();
+        assert!(
+            !is_junk_store_dir(&retired_ro, &retired_ro_name, SystemTime::now()),
+            "freshly retired tombstone must be protected by its active lease even if set_times failed"
         );
     }
 }

@@ -234,15 +234,18 @@ fn parse_cgroup_v1_limit_bytes(content: &str) -> Option<u64> {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn parse_cgroup_v1_hierarchical_limit_bytes(stat_content: &str) -> Option<u64> {
+fn parse_cgroup_v1_hierarchical_stat(stat_content: &str) -> (bool, Option<u64>) {
     for line in stat_content.lines() {
         let Some(rest) = line.strip_prefix("hierarchical_memory_limit") else {
             continue;
         };
-        let value = rest.split_whitespace().next()?;
-        return parse_cgroup_v1_limit_bytes(value);
+        if let Some(value) = rest.split_whitespace().next()
+            && value.parse::<u64>().is_ok()
+        {
+            return (true, parse_cgroup_v1_limit_bytes(value));
+        }
     }
-    None
+    (false, None)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -285,21 +288,42 @@ fn push_cgroup_mount_line(mounts: &mut CgroupMounts, line: &str) {
     let Some((left, right)) = line.split_once(" - ") else {
         return;
     };
-    let left_fields: Vec<&str> = left.split_whitespace().collect();
-    let right_fields: Vec<&str> = right.split_whitespace().collect();
-    if left_fields.len() < 5 || right_fields.len() < 3 {
+    let mut right_fields = right.split_whitespace();
+    let Some(fs_type) = right_fields.next() else {
+        return;
+    };
+    let is_v2 = fs_type == "cgroup2";
+    let is_v1 = fs_type == "cgroup";
+    if !is_v2 && !is_v1 {
         return;
     }
-    let fs_type = right_fields[0];
-    let super_opts = right_fields[2];
-    if fs_type == "cgroup2" {
-        let mount_root = unescape_mountinfo_field(left_fields[3]).into_owned();
-        let mount_point = unescape_mountinfo_field(left_fields[4]).into_owned();
-        mounts.v2.push((mount_root, mount_point));
-    } else if fs_type == "cgroup" && super_opts.split(',').any(|opt| opt == "memory") {
-        let mount_root = unescape_mountinfo_field(left_fields[3]).into_owned();
-        let mount_point = unescape_mountinfo_field(left_fields[4]).into_owned();
-        mounts.v1_memory.push((mount_root, mount_point));
+    let Some(_mount_source) = right_fields.next() else {
+        return;
+    };
+    let Some(super_opts) = right_fields.next() else {
+        return;
+    };
+    if is_v1 && !super_opts.split(',').any(|opt| opt == "memory") {
+        return;
+    }
+    let mut left_fields = left.split_whitespace();
+    let Some(raw_root) = left_fields.nth(3) else {
+        return;
+    };
+    let Some(raw_point) = left_fields.next() else {
+        return;
+    };
+    let mount_root = unescape_mountinfo_field(raw_root).into_owned();
+    let mount_point = unescape_mountinfo_field(raw_point).into_owned();
+    let target = if is_v2 {
+        &mut mounts.v2
+    } else {
+        &mut mounts.v1_memory
+    };
+    if !target.iter().any(|(existing_root, existing_point)| {
+        *existing_root == mount_root && *existing_point == mount_point
+    }) {
+        target.push((mount_root, mount_point));
     }
 }
 
@@ -440,38 +464,52 @@ fn resolve_cgroup_dir(
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Default)]
+struct CgroupWalkResult {
+    readable_controller: bool,
+    limit: Option<u64>,
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn resolve_hierarchy_memory_limit(
     fs_root: &Path,
     mounts: &[(String, String)],
     cgroup_path: &str,
-    walk: fn(&Path, &Path) -> Option<u64>,
+    walk: fn(&Path, &Path) -> CgroupWalkResult,
 ) -> Option<u64> {
     let mut direct_limit = None;
-    let mut saw_direct_mount = false;
-    let mut namespaced_limit = None;
+    let mut saw_readable_direct = false;
+    let mut namespaced_candidates: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (mount_root, mount_point) in mounts {
         match resolve_cgroup_dir(fs_root, mount_root, mount_point, cgroup_path) {
             Some(ResolvedCgroupDir::Direct {
                 mount_dir,
                 cgroup_dir,
             }) => {
-                saw_direct_mount = true;
-                direct_limit = min_opt(direct_limit, walk(&mount_dir, &cgroup_dir));
+                let outcome = walk(&mount_dir, &cgroup_dir);
+                if outcome.readable_controller {
+                    saw_readable_direct = true;
+                    direct_limit = min_opt(direct_limit, outcome.limit);
+                }
             }
             Some(ResolvedCgroupDir::Namespaced {
                 mount_dir,
                 cgroup_dir,
             }) => {
-                namespaced_limit = min_opt(namespaced_limit, walk(&mount_dir, &cgroup_dir));
+                namespaced_candidates.push((mount_dir, cgroup_dir));
             }
             None => {}
         }
     }
-    if saw_direct_mount {
-        direct_limit
-    } else {
-        namespaced_limit
+    if saw_readable_direct {
+        return direct_limit;
     }
+    let mut namespaced_limit = None;
+    for (mount_dir, cgroup_dir) in namespaced_candidates {
+        let outcome = walk(&mount_dir, &cgroup_dir);
+        namespaced_limit = min_opt(namespaced_limit, outcome.limit);
+    }
+    namespaced_limit
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -484,8 +522,8 @@ fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn walk_cgroup_v2_memory_limit(mount_dir: &Path, cgroup_dir: &Path) -> Option<u64> {
-    let mut limit = None;
+fn walk_cgroup_v2_memory_limit(mount_dir: &Path, cgroup_dir: &Path) -> CgroupWalkResult {
+    let mut result = CgroupWalkResult::default();
     let mut current = cgroup_dir.to_path_buf();
     for _ in 0..MAX_CGROUP_WALK_DEPTH {
         if !current.starts_with(mount_dir) {
@@ -495,26 +533,33 @@ fn walk_cgroup_v2_memory_limit(mount_dir: &Path, cgroup_dir: &Path) -> Option<u6
             if let Ok(content) =
                 crate::read_text_file_capped(&current.join(filename), CGROUP_SCALAR_READ_CAP_BYTES)
             {
-                limit = min_opt(limit, parse_cgroup_v2_limit_bytes(&content));
+                let trimmed = content.trim();
+                if trimmed == "max" {
+                    result.readable_controller = true;
+                } else if let Some(bytes) = parse_cgroup_v2_limit_bytes(trimmed) {
+                    result.readable_controller = true;
+                    result.limit = min_opt(result.limit, Some(bytes));
+                }
             }
         }
         if current == mount_dir || !current.pop() {
             break;
         }
     }
-    limit
+    result
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn walk_cgroup_v1_memory_limit(mount_dir: &Path, cgroup_dir: &Path) -> Option<u64> {
-    let mut limit = None;
+fn walk_cgroup_v1_memory_limit(mount_dir: &Path, cgroup_dir: &Path) -> CgroupWalkResult {
+    let mut result = CgroupWalkResult::default();
     if let Ok(stat_content) =
         crate::read_text_file_capped(&cgroup_dir.join("memory.stat"), CGROUP_STAT_READ_CAP_BYTES)
     {
-        limit = min_opt(
-            limit,
-            parse_cgroup_v1_hierarchical_limit_bytes(&stat_content),
-        );
+        let (readable, parsed) = parse_cgroup_v1_hierarchical_stat(&stat_content);
+        if readable {
+            result.readable_controller = true;
+            result.limit = min_opt(result.limit, parsed);
+        }
     }
     let mut current = cgroup_dir.to_path_buf();
     for _ in 0..MAX_CGROUP_WALK_DEPTH {
@@ -524,14 +569,16 @@ fn walk_cgroup_v1_memory_limit(mount_dir: &Path, cgroup_dir: &Path) -> Option<u6
         if let Ok(content) = crate::read_text_file_capped(
             &current.join("memory.limit_in_bytes"),
             CGROUP_SCALAR_READ_CAP_BYTES,
-        ) {
-            limit = min_opt(limit, parse_cgroup_v1_limit_bytes(&content));
+        ) && content.trim().parse::<u64>().is_ok()
+        {
+            result.readable_controller = true;
+            result.limit = min_opt(result.limit, parse_cgroup_v1_limit_bytes(&content));
         }
         if current == mount_dir || !current.pop() {
             break;
         }
     }
-    limit
+    result
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -857,5 +904,32 @@ mod tests {
             &meminfo_file,
         );
         assert_eq!(detected, Some(512 * MIB));
+    }
+
+    #[test]
+    fn cgroup_shadowed_direct_mount_without_controller_files_falls_back_to_namespaced_mount() {
+        let root = tempfile::tempdir().unwrap();
+        // Direct mount directory exists at /mnt/shadow/app but exposes no memory controller files.
+        let shadowed_direct = root.path().join("mnt/shadow/app");
+        let namespaced_real = root.path().join("sys/fs/cgroup/app");
+        std::fs::create_dir_all(&shadowed_direct).unwrap();
+        std::fs::create_dir_all(&namespaced_real).unwrap();
+        std::fs::write(
+            namespaced_real.join("memory.max"),
+            format!("{}\n", 512 * MIB),
+        )
+        .unwrap();
+
+        let cgroup = "0::/app\n";
+        let mountinfo = "\
+10 1 0:25 / /mnt/shadow rw - cgroup2 cgroup2 rw\n\
+28 1 0:25 /kubepods/pod-1 /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+        let meminfo = "MemTotal:       16384000 kB\n";
+
+        assert_eq!(
+            detect_linux_memory_limit_in(root.path(), cgroup, mountinfo, meminfo),
+            Some(512 * MIB),
+            "direct mount directory without readable memory controller files must not suppress a valid namespaced limit"
+        );
     }
 }

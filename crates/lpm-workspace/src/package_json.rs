@@ -824,7 +824,9 @@ pub fn manifest_bytes_may_contain_bin(content: &[u8]) -> bool {
 pub fn parse_name_and_bin_field(
     content: &[u8],
 ) -> Result<(Option<String>, Option<BinConfig>), WorkspaceError> {
-    let parsed: NameAndBin = serde_json::from_slice(strip_utf8_bom_bytes(content))
+    let text = std::str::from_utf8(strip_utf8_bom_bytes(content))
+        .map_err(|e| WorkspaceError::Parse(format!("parse error: {e}")))?;
+    let parsed: NameAndBin = serde_json::from_str(text)
         .map_err(|e| WorkspaceError::Parse(format!("parse error: {e}")))?;
     Ok((parsed.name, parsed.bin))
 }
@@ -1967,5 +1969,30 @@ mod tests {
             assert_eq!(name, None);
             assert!(bin.is_none());
         }
+    }
+
+    #[test]
+    fn parse_name_and_bin_field_rejects_invalid_utf8_in_ignored_and_nested_fields() {
+        let invalid_unrelated =
+            b"{\"name\":\"pkg\",\"description\":\"bad\xffbyte\",\"bin\":\"./cli.js\"}";
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(invalid_unrelated).is_err(),
+            "baseline DOM parser rejects invalid UTF-8 in unrelated fields"
+        );
+        assert!(
+            parse_name_and_bin_field(invalid_unrelated).is_err(),
+            "streaming parser must reject invalid UTF-8 in ignored unrelated fields"
+        );
+
+        let invalid_nested_bin =
+            b"{\"name\":\"pkg\",\"bin\":{\"ok\":\"./cli.js\",\"nested\":{\"bad\":\"\xff\"}}}";
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(invalid_nested_bin).is_err(),
+            "baseline DOM parser rejects invalid UTF-8 nested inside non-string bin entries"
+        );
+        assert!(
+            parse_name_and_bin_field(invalid_nested_bin).is_err(),
+            "streaming parser must reject invalid UTF-8 nested inside non-string bin entries"
+        );
     }
 }
