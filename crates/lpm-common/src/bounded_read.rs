@@ -615,7 +615,9 @@ pub fn permissions_are_owner_only(permissions: &std::fs::Permissions) -> bool {
     permissions.mode() & 0o077 == 0
 }
 
-fn read_opened_file_capped<R: Read>(
+/// Read at most `limit + 1` bytes from an already-open reader, returning
+/// [`BoundedReadError::TooLarge`] if the stream exceeds `limit`.
+pub fn read_opened_file_capped<R: Read>(
     reader: &mut R,
     path: &Path,
     limit: u64,

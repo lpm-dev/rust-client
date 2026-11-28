@@ -1385,7 +1385,6 @@ pub(crate) fn read_regular_file_capped_with_stamp(
 ) -> Result<(Vec<u8>, Option<SyncNoopFileStamp>), lpm_common::BoundedReadError> {
     #[cfg(unix)]
     {
-        use std::io::Read as _;
         let mut file = match lpm_common::open_nofollow(path) {
             Ok(file) => file,
             Err(source)
@@ -1430,21 +1429,7 @@ pub(crate) fn read_regular_file_capped_with_stamp(
             });
         }
         let pre_fd = SyncNoopFileStamp::from_regular_metadata(&pre_meta);
-        let initial_cap = usize::try_from(pre_meta.len().min(64 * 1024 * 1024)).unwrap_or(0);
-        let mut bytes = Vec::with_capacity(initial_cap);
-        let read_limit = cap.saturating_add(1);
-        std::io::Read::take(&mut file, read_limit)
-            .read_to_end(&mut bytes)
-            .map_err(|source| lpm_common::BoundedReadError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > cap {
-            return Err(lpm_common::BoundedReadError::TooLarge {
-                path: path.to_path_buf(),
-                limit: cap,
-            });
-        }
+        let bytes = lpm_common::read_opened_file_capped(&mut file, path, cap, pre_meta.len())?;
         let post_fd = file
             .metadata()
             .ok()
@@ -1455,7 +1440,6 @@ pub(crate) fn read_regular_file_capped_with_stamp(
     }
     #[cfg(windows)]
     {
-        use std::io::Read as _;
         let mut file = match lpm_common::open_nofollow(path) {
             Ok(file) => file,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -1493,21 +1477,7 @@ pub(crate) fn read_regular_file_capped_with_stamp(
         }
         let pre_fd = lpm_common::windows_regular_file_stamp_from_open_file(&file)
             .map(SyncNoopFileStamp::from_windows_stamp);
-        let initial_cap = usize::try_from(pre_meta.len().min(64 * 1024 * 1024)).unwrap_or(0);
-        let mut bytes = Vec::with_capacity(initial_cap);
-        let read_limit = cap.saturating_add(1);
-        std::io::Read::take(&mut file, read_limit)
-            .read_to_end(&mut bytes)
-            .map_err(|source| lpm_common::BoundedReadError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > cap {
-            return Err(lpm_common::BoundedReadError::TooLarge {
-                path: path.to_path_buf(),
-                limit: cap,
-            });
-        }
+        let bytes = lpm_common::read_opened_file_capped(&mut file, path, cap, pre_meta.len())?;
         let post_fd = lpm_common::windows_regular_file_stamp_from_open_file(&file)
             .map(SyncNoopFileStamp::from_windows_stamp);
         let post_path = SyncNoopFileStamp::from_path(path);
