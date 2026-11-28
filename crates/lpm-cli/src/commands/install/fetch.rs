@@ -3088,10 +3088,15 @@ mod tests {
     fn fetch_extract_permits_default_to_platform_bound_for_v2_installs() {
         let permits = default_fetch_extract_permits(true).unwrap();
         assert_eq!(permits, default_bounded_fetch_extract_permits());
+        let expected = lpm_common::resources::default_fetch_extract_permits(
+            lpm_common::resources::effective_cpu_count(),
+            lpm_common::resources::effective_memory_limit_bytes(),
+        );
+        assert_eq!(permits, expected);
         #[cfg(target_os = "macos")]
-        assert_eq!(permits, 4);
+        assert!((1..=4).contains(&permits));
         #[cfg(not(target_os = "macos"))]
-        assert!((4..=12).contains(&permits));
+        assert!((1..=8).contains(&permits));
     }
 
     #[test]
